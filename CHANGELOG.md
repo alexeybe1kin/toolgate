@@ -5,6 +5,11 @@ things, and a dashboard reading one field for both is wrong about every module
 it does not special-case. A change to the shape of `/health` or any endpoint is
 a contract change and gets its own entry.
 
+## 0.2.1
+
+Publish workflow only: attestation is skipped while the repository is private,
+so a successful image push is no longer reported as a failure.
+
 ## 0.2.0
 
 **The vault stored provider credentials in plaintext.** "Write-only" is a
