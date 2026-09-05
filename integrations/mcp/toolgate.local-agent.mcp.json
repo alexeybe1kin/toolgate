@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "toolgate": {
+      "command": "python",
+      "args": ["toolgate/mcp/toolgate_mcp.py"],
+      "env": {
+        "TOOLGATE_MCP_ACTOR": "Pi MCP",
+        "TOOLGATE_MCP_PRESERVE_IDS": "0"
+      }
+    }
+  }
+}

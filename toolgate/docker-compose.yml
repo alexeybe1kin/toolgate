@@ -1,0 +1,45 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: toolgate/Dockerfile
+    container_name: toolgate-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8010:8010"
+    volumes:
+      - ./:/app/toolgate
+    env_file:
+      - path: .env
+        required: false
+    networks:
+      - default
+      - memorygate
+
+  dashboard:
+    build:
+      context: ../dashboard
+    container_name: toolgate-dashboard
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8011:8011"
+
+  searxng:
+    image: searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812
+    container_name: toolgate-searxng
+    restart: unless-stopped
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    networks:
+      default:
+        aliases:
+          - toolgate-searxng
+      memorygate:
+        aliases:
+          - searxng
+          - toolgate-searxng
+
+networks:
+  memorygate:
+    external: true
+    name: conker_net

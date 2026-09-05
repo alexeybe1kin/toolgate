@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""ToolGate v2 CLI for scoped agents.
+
+Set TOOLGATE_EXECUTION_KEY for agent use. Add --json to any command for a stable
+machine-readable result. Owner management remains isolated in the dashboard.
+"""
+import json
+import os
+import sys
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+CONFIG_PATH = Path(os.environ.get("TOOLGATE_CONFIG", Path.home() / ".config" / "toolgate" / "credentials.env"))
+
+
+def _load_credentials(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if name:
+            os.environ.setdefault(name, value)
+
+
+_load_credentials(CONFIG_PATH)
+
+BASE_URL = os.environ.get("TOOLGATE_URL", "http://127.0.0.1:8010")
+EXECUTION_KEY = os.environ.get("TOOLGATE_EXECUTION_KEY")
+
+
+def _flags(args):
+    output_json = "--json" in args
+    if output_json:
+        args.remove("--json")
+    values = {}
+    while args and args[0].startswith("--"):
+        key = args.pop(0)[2:].replace("-", "_")
+        if not args:
+            raise ValueError(f"--{key.replace('_', '-')} needs a value")
+        values[key] = _coerce(args.pop(0))
+    return values, output_json
+
+
+def _coerce(value):
+    lowered = value.lower()
+    if lowered == "true": return True
+    if lowered == "false": return False
+    if lowered == "null": return None
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+
+
+def _request(method, path, body=None, *, output_json=False):
+    headers = {"X-ToolGate-Execution-Key": EXECUTION_KEY or ""}
+    encoded = json.dumps(body).encode("utf-8") if body is not None else None
+    if encoded is not None:
+        headers["Content-Type"] = "application/json"
+    try:
+        request = Request(BASE_URL + path, data=encoded, headers=headers, method=method)
+        with urlopen(request, timeout=120) as response:
+            raw = response.read()
+            status = response.status
+        data = json.loads(raw) if raw else {}
+    except HTTPError as exc:
+        status = exc.code
+        try:
+            data = json.loads(exc.read())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            data = {"code": "REQUEST_FAILED", "message": str(exc)}
+    except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        data, status = {"code": "NETWORK_ERROR", "message": str(exc)}, 0
+    if status >= 400 or status == 0:
+        detail = data.get("detail", data) if isinstance(data, dict) else data
+        if isinstance(detail, dict):
+            data = detail
+        elif not isinstance(data, dict):
+            data = {"code": "REQUEST_FAILED", "message": str(detail)}
+        if output_json:
+            print(json.dumps(data, indent=2))
+        else:
+            print(f"ERROR [{data.get('code', 'REQUEST_FAILED')}]: {data.get('message', data)}")
+            if data.get("next_action"):
+                print(f"NEXT: {data['next_action']}")
+        return 1
+    if output_json:
+        print(json.dumps(data, indent=2))
+    else:
+        _human(data)
+    return 0
+
+
+def _human(data):
+    if isinstance(data, list):
+        if not data:
+            print("No results.")
+        for item in data:
+            print(f"{item.get('id', item.get('name', 'item'))}: {item.get('description', item.get('status', ''))}")
+        return
+    if data.get("code") == "OK":
+        print(data.get("message", "Completed."))
+    elif data.get("code") in {"CONFIRMATION_REQUIRED", "REQUEST_PENDING"}:
+        print(f"{data['code']}: {data.get('message', '')}")
+        print(f"REQUEST: {data.get('request_id')}")
+    else:
+        print(json.dumps(data, indent=2))
+
+
+def _info(path, output_json):
+    return _request("GET", path, output_json=output_json)
+
+
+def usage():
+    print("""Usage:
+  toolgate status [--json]
+  toolgate update [--json]
+  toolgate watch [--json]
+  toolgate tool list [--json]
+  toolgate tool <name> info [--json]
+  toolgate tool <name> --argument value [--approval-request-id <id>] [--json]
+  toolgate automation list [--json]
+  toolgate automation <name> info [--json]
+  toolgate automation <name> run --argument value [--approval-request-id <id>] [--json]
+  toolgate request create-tool|create-automation|edit|delete|secret "description" [--json]
+  toolgate request status <id> [--json]
+""")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        usage(); return 0
+    try:
+        command = args.pop(0)
+        if command == "status":
+            _, output_json = _flags(args)
+            return _request("GET", "/v2/agent/status", output_json=output_json)
+        if command in {"update", "watch"}:
+            _, output_json = _flags(args)
+            return _request("GET", "/v2/agent/events", output_json=output_json)
+        if command == "tool":
+            if not args: usage(); return 2
+            name = args.pop(0)
+            if name == "list":
+                _, output_json = _flags(args)
+                return _info("/v2/agent/tools", output_json)
+            if args and args[0] == "info":
+                args.pop(0); _, output_json = _flags(args)
+                return _info(f"/v2/agent/tools/{name}", output_json)
+            values, output_json = _flags(args)
+            approval = values.pop("approval_request_id", None)
+            return _request("POST", f"/v2/tools/{name}/invoke",
+                            {"args": values, "approval_request_id": approval}, output_json=output_json)
+        if command == "automation":
+            if not args: usage(); return 2
+            name = args.pop(0)
+            if name == "list":
+                _, output_json = _flags(args)
+                return _info("/v2/agent/automations", output_json)
+            if args and args[0] == "info":
+                args.pop(0); _, output_json = _flags(args)
+                return _info(f"/v2/agent/automations/{name}", output_json)
+            if not args or args.pop(0) != "run":
+                print("Usage: toolgate automation <name> run --argument value", file=sys.stderr); return 2
+            values, output_json = _flags(args)
+            approval = values.pop("approval_request_id", None)
+            return _request("POST", f"/v2/automations/{name}/run",
+                            {"args": values, "approval_request_id": approval}, output_json=output_json)
+        if command == "request":
+            if not args: usage(); return 2
+            sub = args.pop(0)
+            if sub == "status" and args:
+                request_id = args.pop(0); _, output_json = _flags(args)
+                return _request("GET", f"/v2/agent/requests/{request_id}", output_json=output_json)
+            if not args:
+                print("A request description is required.", file=sys.stderr); return 2
+            output_json = "--json" in args
+            if output_json:
+                args.remove("--json")
+            if not args:
+                print("A request description is required.", file=sys.stderr); return 2
+            details = " ".join(args)
+            return _request("POST", "/v2/requests", {"kind": sub, "title": f"Agent request: {sub}", "details": details},
+                            output_json=output_json)
+    except ValueError as exc:
+        print(f"ERROR [USAGE_ERROR]: {exc}", file=sys.stderr); return 2
+    usage(); return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
