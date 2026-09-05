@@ -7,7 +7,9 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
 
@@ -50,6 +52,13 @@ def startup():
     generated = vault.ensure_control_keys()
     for name in generated:
         print(f"[toolgate] generated and persisted {name}; value intentionally not logged")
+    # A vault that cannot encrypt must not quietly keep provider keys in the clear.
+    try:
+        moved = vault.encrypt_values_at_rest()
+    except vault.VaultError as exc:
+        raise RuntimeError(f"ToolGate refuses to start without a usable vault key. {exc}") from exc
+    if moved:
+        print(f"[toolgate] encrypted {moved} vault value(s) at rest; values intentionally not logged")
     bootstrap_key = os.environ.get("TOOLGATE_BOOTSTRAP_EXECUTION_KEY", "").strip()
     if bootstrap_key:
         scopes = [scope.strip() for scope in os.environ.get("TOOLGATE_BOOTSTRAP_SCOPES", "tool:*,automation:*").split(",") if scope.strip()]
@@ -194,9 +203,84 @@ def ensure_builtin_research_capabilities() -> None:
         control_plane.event("builtin_tool_synced", "info", "tool", definition["id"], "system", {"version": definition["version"]})
 
 
+HEALTH_CACHE_SECONDS = 15
+HEALTH_PROBE_TIMEOUT_SECONDS = 2.0
+_HEALTHY_STATUSES = {"ok", "not_configured"}
+_health_snapshot: dict | None = None
+
+
+def _probe_control_plane() -> dict:
+    """Open the control-plane database for real rather than assuming it is there."""
+    try:
+        control_plane.settings()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return {"status": "unavailable", "reason": type(exc).__name__}
+    return {"status": "ok"}
+
+
+def _probe_http(url: str, path: str) -> dict:
+    """Coarse reachability of one upstream. Never returns the host or the body."""
+    try:
+        response = httpx.get(f"{url.rstrip('/')}{path}", timeout=HEALTH_PROBE_TIMEOUT_SECONDS)
+    except httpx.HTTPError as exc:
+        return {"status": "unreachable", "reason": type(exc).__name__}
+    if response.status_code >= 500:
+        return {"status": "degraded", "reason": "upstream_5xx"}
+    return {"status": "ok"}
+
+
+def _memorygate_configured() -> bool:
+    try:
+        return bool(vault.get_key("MEMORYGATE_READ_KEY"))
+    except KeyError:
+        return False
+
+
+def _run_dependency_checks() -> dict:
+    checks = {"control_plane_db": _probe_control_plane(), "vault": vault.vault_status()}
+    try:
+        settings = control_plane.settings()
+    except (sqlite3.Error, OSError, ValueError):
+        settings = {}
+
+    probes = {"searxng": (settings.get("research_searxng_url", "http://toolgate-searxng:8080"), "/healthz")}
+    if _memorygate_configured():
+        probes["memorygate"] = (os.environ.get("MEMORYGATE_URL", "http://memorygate-api:8020"), "/health")
+        probes["planner"] = (settings.get("planner_url", "http://memorygate-ollama:11434"), "/api/tags")
+    else:
+        # The planner and the MemoryGate executors both live in that stack; with
+        # no read credential neither is configured, so neither can be "down".
+        checks["memorygate"] = {"status": "not_configured"}
+        checks["planner"] = {"status": "not_configured"}
+
+    with ThreadPoolExecutor(max_workers=len(probes)) as pool:
+        results = {name: pool.submit(_probe_http, url, path) for name, (url, path) in probes.items()}
+    checks.update({name: future.result() for name, future in results.items()})
+
+    failing = sorted(name for name, check in checks.items() if check["status"] not in _HEALTHY_STATUSES)
+    return {"status": "degraded" if failing else "ok", "degraded": failing, "checks": checks,
+            "checked_at": datetime.now(timezone.utc).isoformat()}
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "v2"}
+    """Unauthenticated liveness plus real dependency probes.
+
+    Probe detail stays coarse -- a status word and an exception class, never a
+    host, a credential or an upstream body -- because anyone can call this.
+    Results are cached briefly so an anonymous caller cannot turn the endpoint
+    into an outbound request amplifier; the age of the cached answer is
+    reported rather than hidden.
+    """
+    global _health_snapshot
+    now = time.monotonic()
+    snapshot = _health_snapshot
+    if snapshot is None or now - snapshot["probed_at"] >= HEALTH_CACHE_SECONDS:
+        snapshot = {**_run_dependency_checks(), "probed_at": now}
+        _health_snapshot = snapshot
+    return {"status": snapshot["status"], "version": "v2", "degraded": snapshot["degraded"],
+            "checks": snapshot["checks"], "checked_at": snapshot["checked_at"],
+            "age_seconds": round(now - snapshot["probed_at"], 1)}
 
 
 @app.get("/auth/check")

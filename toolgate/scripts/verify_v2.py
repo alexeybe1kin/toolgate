@@ -4,20 +4,32 @@
 The script creates namespaced temporary capabilities and keys, validates the
 security boundary, and removes those temporary objects before exiting. It never
 prints or sends vault values except to their intended signed callback verifier.
+
+It reads vault values through ``toolgate.core.vault`` rather than parsing
+``.env``, because stored values are ciphertext. That means it has to run
+somewhere the vault key is reachable -- inside the API container
+(``docker compose exec api python toolgate/scripts/verify_v2.py``) or on a host
+with ``TOOLGATE_VAULT_SECRET`` set.
 """
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
+import sys
 import time
 from pathlib import Path
 
 import httpx
 from dotenv import dotenv_values
 
-
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from toolgate.core import vault  # noqa: E402
+
+
 API = "http://127.0.0.1:8010"
 TOOL_ID = "verify-owner-confirmation"
 AI_TOOL_ID = "verify-local-ai"
@@ -30,12 +42,16 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> None:
-    owner_env = dotenv_values(ROOT / "toolgate" / ".env")
     agent_env = dotenv_values(Path.home() / ".config" / "toolgate" / "credentials.env")
-    owner_key = owner_env.get("TOOLGATE_ADMIN_KEY")
+    owner_key = vault.get_control_key("TOOLGATE_ADMIN_KEY")
     execution_key = agent_env.get("TOOLGATE_EXECUTION_KEY")
-    callback_secret = owner_env.get("TOOLGATE_CALLBACK_SECRET")
-    memory_secret = owner_env.get("MEMORYGATE_READ_KEY")
+    try:
+        # Decrypted through the vault: the stored form is ciphertext, and the
+        # leak assertion below has to compare against the real value.
+        callback_secret = vault.get_key("TOOLGATE_CALLBACK_SECRET")
+        memory_secret = vault.get_key("MEMORYGATE_READ_KEY")
+    except KeyError as exc:
+        raise AssertionError(f"required local credentials are missing or unreadable: {exc}") from exc
     check(bool(owner_key and execution_key and callback_secret and memory_secret), "required local credentials are missing")
 
     owner = {"X-ToolGate-Key": owner_key}

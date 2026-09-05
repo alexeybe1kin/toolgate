@@ -1,5 +1,7 @@
 .env
 toolgate/.env
+vault.key
+toolgate/vault.key
 .venv
 node_modules
 .next

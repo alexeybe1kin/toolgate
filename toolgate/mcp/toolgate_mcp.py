@@ -1,5 +1,32 @@
 #!/usr/bin/env python3
-"""stdio MCP server that exposes active ToolGate tools through ToolGate internals."""
+"""Single-operator console bridge: stdio MCP over ToolGate's in-process internals.
+
+THIS BRIDGE HAS NO IDENTITY AND NO SCOPE. It is a convenience for one trusted
+human operating their own machine, and nothing else.
+
+What it does not do, stated plainly:
+
+* It reads no execution key. There is no caller to authenticate.
+* It never calls ``control_plane.is_scoped``. Every tool whose status is
+  ``active`` is listed and callable, whatever the owner scoped anyone to.
+* Every call is attributed to the single hardcoded actor ``local-mcp``, so the
+  audit trail cannot tell two callers apart and the approval binding's
+  originating-agent check is a no-op across everything that arrives here.
+* It imports the control plane in-process and needs local file access to
+  ``toolgate.db`` and ``.env``, so it cannot reach a remote ToolGate.
+
+The rest of the boundary does still apply: lockdown, input validation,
+``authorization: blocked``, the approval binding, usage limits, the restricted
+executors, output validation and audit events all run exactly as they do over
+HTTP. It is the identity and scope layer that is absent -- which is precisely
+the layer that makes an untrusted caller safe.
+
+**Never expose this bridge to an autonomous agent.** An agent attached here
+holds the entire active catalogue with no scope and no attributable identity.
+Agents use the keyed HTTP API with a scoped execution key
+(``X-ToolGate-Execution-Key``), which enforces both. See
+``docs/SINGLE_OPERATOR_MCP_BRIDGE.md``.
+"""
 from __future__ import annotations
 
 import json
@@ -44,10 +71,16 @@ def _server_module():
 
 
 def _local_actor() -> dict:
-    return {"id": "local-mcp", "name": os.environ.get("TOOLGATE_MCP_ACTOR", "Pi MCP")}
+    return {"id": "local-mcp", "name": os.environ.get("TOOLGATE_MCP_ACTOR", "Operator console")}
 
 
 def _visible_tools() -> list[dict]:
+    """Every active tool, with no scope filter.
+
+    Deliberate: there is no execution key here and therefore no agent to scope
+    against. This is why the bridge is single-operator only -- see the module
+    docstring.
+    """
     return [
         tool
         for tool in control_plane.list_objects("tool")
@@ -312,6 +345,11 @@ def _handle_request(request: dict) -> None:
 
 
 def main() -> int:
+    # Said out loud on every start, because the one way this bridge becomes
+    # dangerous is somebody attaching an agent to it without reading the docs.
+    print("[toolgate-mcp] single-operator console bridge: no execution key, no scope check, "
+          "every active tool exposed. Do not attach an autonomous agent; use the keyed HTTP API.",
+          file=sys.stderr, flush=True)
     for line in sys.stdin:
         request = None
         try:

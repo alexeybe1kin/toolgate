@@ -9,9 +9,21 @@ services:
       - "127.0.0.1:8010:8010"
     volumes:
       - ./:/app/toolgate
+      # The vault key lives on its own volume, never in the bind-mounted source
+      # directory: a copy of that directory must not carry the key that
+      # decrypts the values inside it.
+      - toolgate-vault:/var/lib/toolgate
+    environment:
+      TOOLGATE_VAULT_KEY_FILE: /var/lib/toolgate/vault.key
     env_file:
       - path: .env
         required: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     networks:
       - default
       - memorygate
@@ -38,6 +50,9 @@ services:
         aliases:
           - searxng
           - toolgate-searxng
+
+volumes:
+  toolgate-vault:
 
 networks:
   memorygate:

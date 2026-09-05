@@ -20,9 +20,9 @@ The dashboard includes a command center, live execution and AI activity, service
 - `toolgate/api/`: FastAPI owner and agent API, restricted executors, automation runtime, verification callbacks, built-in research tool sync, and ToolGate AI planning endpoints.
 - `toolgate/core/`: SQLite control-plane storage, policy helpers, vault integration, planner helpers, research adapters, and runtime paths.
 - `toolgate/cli/`: standard-library agent CLI for scoped execution keys.
-- `toolgate/mcp/`: stdio MCP bridge that exposes active ToolGate tools as native MCP tools for Pi and other local agents.
+- `toolgate/mcp/`: single-operator stdio MCP console bridge. It has no execution key and no scope check; it is for the owner's own machine, never for an agent.
 - `dashboard/`: React and Vite owner dashboard for services, tools, automations, requests, secrets, security controls, and ToolGate AI sessions.
-- `integrations/mcp/`: example MCP client configuration.
+- `integrations/mcp/`: example MCP client configuration for the single-operator console bridge.
 - `docs/`: integration notes and dashboard screenshots.
 - `toolgate/tests/`: deterministic tests for the control plane, security model, workflow engine, research adapters, and MCP adapter.
 - `toolgate/scripts/`: live verification utilities for a running local stack.
@@ -41,7 +41,8 @@ The dashboard includes a command center, live execution and AI activity, service
 
 - Agents authenticate with rotatable execution keys and explicit `tool:*`, `tool:<id>`, `automation:*`, or `automation:<id>` scopes.
 - Management endpoints require the separate admin key. Agent keys cannot manage services, secrets, policies, verification methods, or requests.
-- Vault values are write-only. ToolGate lists reference names but has no API for revealing stored values.
+- Vault values are write-only **and encrypted at rest**. ToolGate lists reference names, no API reveals a value, and the stored value is a Fernet token whose key is derived from an install-time secret held outside the values file.
+- `/health` runs real dependency probes. It reports `degraded` and names the failing dependency instead of returning a hardcoded `ok`.
 - Inputs are validated deterministically by type, range, length, pattern, and allowed values before execution.
 - Rate, cooldown, runtime, workflow-step, destination, response-size, loop, retry, and delay ceilings are enforced in code.
 - Sensitive actions bind approval to the exact object type, object ID, version, argument digest, nonce, and expiry.
@@ -51,6 +52,8 @@ The dashboard includes a command center, live execution and AI activity, service
 - Logs and API responses contain references and redacted outcomes, never injected secret values.
 - Browser access is restricted to configured local dashboard origins.
 
+The stdio MCP bridge is the one deliberate exception to the identity and scope rules above: it authenticates nobody and scopes nothing. It exists for a single trusted operator on the owner's own machine. Never attach an autonomous agent to it -- see [`docs/SINGLE_OPERATOR_MCP_BRIDGE.md`](docs/SINGLE_OPERATOR_MCP_BRIDGE.md).
+
 ToolGate reduces agent and prompt-injection risk, but it cannot protect a host that is already fully compromised. Keep the API private, protect the admin key, and use OS/container isolation as the outer security boundary.
 
 ## Bounded Web Research
@@ -59,7 +62,7 @@ Research tools accept typed queries and fixed source names, not arbitrary URLs. 
 
 HTML is reduced before model use: scripts, styles, SVG, hidden elements, navigation, forms, page chrome, cookie prompts, subscription prompts, and repeated lines are removed. Unicode control characters are normalized, search-provider markup is stripped, long encoded blobs and instruction/exfiltration patterns are blocked, and surviving text is enclosed in an explicit untrusted-content boundary. These controls reduce both tokens and attack surface, but retrieved content must still be treated as hostile evidence rather than instructions.
 
-Product Hunt can be used as an optional read-only competition provider. Because Product Hunt requires separate permission for commercial API use, ToolGate keeps it disabled until the owner confirms that approval in Settings and stores `PRODUCTHUNT_TOKEN` through Secrets. The token remains in ToolGate; Emolga receives only locally filtered, redacted product metadata. SearXNG remains the automatic fallback.
+Product Hunt can be used as an optional read-only competition provider. Because Product Hunt requires separate permission for commercial API use, ToolGate keeps it disabled until the owner confirms that approval in Settings and stores `PRODUCTHUNT_TOKEN` through Secrets. The token remains in ToolGate; the caller receives only locally filtered, redacted product metadata. SearXNG remains the automatic fallback.
 
 Business research is exposed as small reusable tools instead of one monolithic
 search action. Atomic tools cover broad web search, Reddit, Hacker News, GitHub
@@ -82,9 +85,15 @@ missing optional credentials fail closed or fall back without exposing values.
 Tool definitions can use these first-class executors:
 
 - `echo`: returns validated arguments for local deterministic capabilities and testing.
+- `local_echo`: returns a digest and length only, for proving the approval path without touching the network or the filesystem.
 - `http_json`: bounded GET or owner-confirmed POST requests to exact public HTTPS hosts; redirects and private destinations are denied.
 - `memorygate`: fixed-host, read-only `context` or `ask` operations using a vault-held MemoryGate credential.
 - `ollama_generate`: bounded generation through the internal Ollama service with declared prompt inputs and no secret access.
+- `gemini_generate`: bounded generation through an allowlisted hosted Gemini model, with the key injected as a header from the vault.
+- `research_search`: one bounded provider search returning short-lived provenance handles.
+- `research_bundle`: a reusable multi-source research profile that preserves per-source reports and failures.
+- `research_fetch`: resolves exactly one server-issued research handle. It does not accept URLs.
+- `research_fetch_batch`: resolves up to eight handles as one bounded, scanned batch.
 
 Arbitrary agent-supplied Python and legacy script execution are intentionally unsupported.
 
@@ -123,25 +132,24 @@ toolgate watch
 
 Add `--json` to any command for a stable machine-readable contract. Values such as integers, arrays, objects, booleans, and `null` are coerced from JSON. Confirmation responses include a `request_id` and exact retry command using `--approval-request-id`.
 
-## Local Agent MCP Bridge
+## Single-Operator MCP Console Bridge
 
-ToolGate includes a local stdio MCP bridge for Pi and similar agents. The
-bridge discovers the active ToolGate tools from ToolGate's own configured
-state, maps their typed inputs to MCP JSON Schema, and invokes ToolGate
-through its internal execution path. Tool IDs are exposed with MCP-friendly
-names such as `research_search` while still executing the original ToolGate
-tool IDs.
+ToolGate ships a stdio MCP bridge at `toolgate/mcp/toolgate_mcp.py`. It is a
+convenience for **one trusted human on the machine that holds ToolGate's state**,
+so that the owner can drive their own ToolGate from an MCP client without
+minting a key.
 
-The agent sees these as normal MCP tools through `tools/list` and calls them
-through `tools/call`. ToolGate responses are returned as JSON text inside MCP
-tool content. Approval-required tools return ToolGate's normal
-`CONFIRMATION_REQUIRED` payload, including `request_id`; retry the same MCP tool
-call with `approval_request_id` after owner approval.
+**It bypasses identity and scope.** It reads no execution key, never calls
+`is_scoped`, exposes every tool with `status: active`, and attributes every call
+to one hardcoded actor. **Never attach an autonomous agent to it.** Agents use
+the keyed HTTP API with a scoped execution key, which authenticates the caller,
+filters the catalogue by scope and binds each approval to the key that asked for
+it.
 
-The bridge is local and in-repo. It reads active ToolGate tool definitions from
-the control-plane state, syncs built-in research tools before listing, and uses
-ToolGate's own `invoke_tool(...)` path for validation, rate limits, approval
-binding, restricted executors, audit events, and MemoryGate access.
+Everything below the identity layer still applies over the bridge: lockdown,
+input validation, `authorization: blocked`, the approval binding, usage limits,
+the restricted executors, output validation and audit events. It is a hole in
+*who is asking*, not in policy.
 
 Example config:
 
@@ -152,7 +160,7 @@ Example config:
       "command": "python",
       "args": ["toolgate/mcp/toolgate_mcp.py"],
       "env": {
-        "TOOLGATE_MCP_ACTOR": "Pi MCP",
+        "TOOLGATE_MCP_ACTOR": "Operator console",
         "TOOLGATE_MCP_PRESERVE_IDS": "0"
       }
     }
@@ -161,8 +169,10 @@ Example config:
 ```
 
 Set `TOOLGATE_MCP_PRESERVE_IDS=1` only if the MCP client accepts dotted tool
-names such as `research.search`. See `docs/LOCAL_AGENT_MCP.md` and
-`integrations/mcp/toolgate.local-agent.mcp.json`.
+names such as `research.search`. Read
+[`docs/SINGLE_OPERATOR_MCP_BRIDGE.md`](docs/SINGLE_OPERATOR_MCP_BRIDGE.md)
+before using it; the example config is at
+`integrations/mcp/toolgate.single-operator.mcp.json`.
 
 ## Local Deployment
 
@@ -172,16 +182,58 @@ names such as `research.search`. See `docs/LOCAL_AGENT_MCP.md` and
 Copy-Item toolgate\.env.example toolgate\.env
 ```
 
-2. Start the API and dashboard:
+2. Create the shared Docker network the compose file joins, if it does not exist yet:
+
+```powershell
+docker network create conker_net
+```
+
+3. Start the API, dashboard and SearXNG. The compose file lives in `toolgate/` and its build context is the repository root, so run it from there:
 
 ```powershell
 Set-Location toolgate
 docker compose up -d --build
 ```
 
-3. Open `http://localhost:8011`. The API is available at `http://localhost:8010`.
+4. Open `http://localhost:8011`. The API is available at `http://localhost:8010`.
 
 Blank control keys are generated and persisted on first API startup, but their values are intentionally never printed to logs. Read the local `toolgate/.env` file once to sign into the dashboard, then protect that file with host permissions.
+
+### The vault key
+
+Vault values are stored encrypted. The key that decrypts them is derived from an install-time secret that never lives in the values file:
+
+- `TOOLGATE_VAULT_SECRET` in the environment, if set. Preferred: a Docker secret or an orchestrator-supplied value that never touches the data directory at all.
+- Otherwise the key file named by `TOOLGATE_VAULT_KEY_FILE`, created `0600` with a fresh random secret on first start. The compose file points this at a dedicated `toolgate-vault` volume rather than at the bind-mounted source directory, so a copy of that directory does not carry the key that decrypts it.
+
+Running outside Docker with neither set, the key file defaults to `toolgate/vault.key`, beside the values it protects -- which only helps against a stray copy of `.env`. Set `TOOLGATE_VAULT_SECRET`, or move the key file, for anything you care about.
+
+**Back the key up with the data.** Losing it means losing every stored provider credential; they have to be entered again. `docker compose down -v` deletes the volume, and with it the key.
+
+An install that predates encryption is migrated on its next start: cleartext values in `.env` are rewritten as `enc:v1:` tokens and the count is logged, never the values. If no key can be read or written, ToolGate **refuses to start** rather than falling back to cleartext.
+
+### Health
+
+`GET /health` is unauthenticated and runs real probes: the control-plane database, the vault, SearXNG, and -- when a MemoryGate credential is configured -- MemoryGate and the planner.
+
+```json
+{
+  "status": "degraded",
+  "version": "v2",
+  "degraded": ["planner"],
+  "checks": {
+    "control_plane_db": {"status": "ok"},
+    "vault": {"status": "ok", "key_source": "key_file"},
+    "searxng": {"status": "ok"},
+    "memorygate": {"status": "ok"},
+    "planner": {"status": "unreachable", "reason": "ConnectError"}
+  },
+  "checked_at": "2026-09-05T11:08:05.185008+00:00",
+  "age_seconds": 0.0
+}
+```
+
+`status` is `ok` only when nothing configured is failing. Detail stays coarse -- a status word and an exception class, never a host, a credential or an upstream body -- because anyone can call this. Results are cached for 15 seconds so an anonymous caller cannot use the endpoint as an outbound request amplifier, and `age_seconds` reports how old the answer is rather than hiding it.
 
 ## MemoryGate
 
@@ -211,19 +263,22 @@ Send the digest as `X-ToolGate-Signature: sha256=<hex>` and the Unix timestamp a
 Run the deterministic unit suite:
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s toolgate\tests -v
+python -m unittest discover -s toolgate\tests -t . -v
 ```
 
-Run only the MCP adapter tests:
+Run one file:
 
 ```powershell
-python -m unittest toolgate.tests.test_mcp_adapter -v
+python -m unittest toolgate.tests.test_approval_boundary -v
 ```
 
-With both Docker stacks running, execute the live boundary verifier:
+The suite is not all in-memory: the approval binding is driven over the ASGI app against a real SQLite database -- including a twelve-thread race that must produce exactly one success -- and `/health` is checked against an upstream that is genuinely stopped mid-test.
+
+With both Docker stacks running, execute the live boundary verifier. It reads vault values through the vault rather than parsing `.env`, so it has to run where the vault key is — inside the API container:
 
 ```powershell
-.\.venv\Scripts\python.exe toolgate\scripts\verify_v2.py
+Set-Location toolgate
+docker compose exec api python toolgate/scripts/verify_v2.py
 ```
 
 The live verifier creates temporary namespaced capabilities and keys, tests executors, workflows, scope isolation, exact approvals, callback replay resistance, redaction, and lockdown, then removes its temporary objects.
@@ -233,13 +288,13 @@ The live verifier creates temporary namespaced capabilities and keys, tests exec
 ```text
 dashboard/                 React and Vite owner dashboard
 dashboard/server.py        Local dashboard static server
-docs/LOCAL_AGENT_MCP.md    Local-agent MCP bridge behavior and configuration
+docs/SINGLE_OPERATOR_MCP_BRIDGE.md
 docs/screenshots/          Dashboard screenshots used by this README
 integrations/mcp/          Example MCP client configuration
 toolgate/api/              FastAPI control-plane, agent API, and execution runtime
 toolgate/cli/              Agent-facing CLI
 toolgate/core/             Vault, policy, persistence, research, and planner modules
-toolgate/mcp/              MCP bridge for Pi and other local agents
+toolgate/mcp/              Single-operator MCP console bridge (no key, no scope)
 toolgate/scripts/          Operational verification utilities
 toolgate/searxng/          Local SearXNG configuration used by research fallback
 toolgate/tests/            Deterministic security, workflow, research, and MCP tests

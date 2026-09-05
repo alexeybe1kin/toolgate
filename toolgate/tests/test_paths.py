@@ -15,8 +15,9 @@ class RuntimePathsTests(unittest.TestCase):
             {"TOOLGATE_DATA_DIR": root, "TOOLGATE_ENV_PATH": f"{root}/vault.env"},
         ):
             reloaded = importlib.reload(paths)
-            self.assertEqual(str(reloaded.DB_PATH), f"{root}/toolgate.db")
-            self.assertEqual(str(reloaded.ENV_PATH), f"{root}/vault.env")
+            # Compared as paths, not strings: the separator differs by platform.
+            self.assertEqual(reloaded.DB_PATH, Path(root) / "toolgate.db")
+            self.assertEqual(reloaded.ENV_PATH, Path(root) / "vault.env")
         importlib.reload(paths)
 
 

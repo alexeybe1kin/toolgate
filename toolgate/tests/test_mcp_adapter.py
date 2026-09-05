@@ -1,3 +1,5 @@
+import contextlib
+import io
 import unittest
 from unittest.mock import patch
 
@@ -91,10 +93,34 @@ class ToolGateMcpTests(unittest.TestCase):
         server_module.return_value.invoke_tool.assert_called_once_with(
             tool,
             {},
-            "Pi MCP",
+            "Operator console",
             approval_request_id="req-1",
             actor_id="local-mcp",
         )
+
+    @patch("toolgate.mcp.toolgate_mcp.control_plane.list_objects")
+    def test_the_bridge_exposes_every_active_tool_with_no_scope_filter(self, list_objects):
+        # Asserted, not lamented: this bridge has no execution key and therefore
+        # no agent to scope against, which is exactly why it is single-operator
+        # only. See the module docstring and docs/SINGLE_OPERATOR_MCP_BRIDGE.md.
+        list_objects.return_value = [
+            {"id": "research.search", "status": "active", "inputs": []},
+            {"id": "payments.transfer", "status": "active", "inputs": []},
+            {"id": "retired.tool", "status": "disabled", "inputs": []},
+        ]
+
+        visible = [tool["id"] for tool in toolgate_mcp._visible_tools()]
+
+        self.assertEqual(visible, ["research.search", "payments.transfer"])
+
+    def test_the_bridge_warns_on_stdout_of_the_client_that_it_has_no_scope(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), patch("sys.stdin", io.StringIO("")):
+            toolgate_mcp.main()
+
+        warning = stderr.getvalue()
+        self.assertIn("no scope check", warning)
+        self.assertIn("Do not attach an autonomous agent", warning)
 
 
 if __name__ == "__main__":
