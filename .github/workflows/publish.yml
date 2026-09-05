@@ -61,7 +61,10 @@ jobs:
       - id: build
         uses: docker/build-push-action@v6
         with:
-          context: ./toolgate
+          # Built from the repository root: the Dockerfile copies
+          # toolgate/requirements.txt, so a narrower context cannot see it.
+          context: .
+          file: toolgate/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -69,6 +72,11 @@ jobs:
           cache-to: type=gha,mode=max
 
       - uses: actions/attest-build-provenance@v2
+        # Provenance attestation is not available for user-owned private
+        # repositories. The image is already pushed by this point, so failing
+        # here would report a successful publish as a failed one. It starts
+        # working by itself when the repository goes public.
+        if: ${{ !github.event.repository.private }}
         with:
           subject-name: ${{ env.REGISTRY }}/${{ github.repository }}
           subject-digest: ${{ steps.build.outputs.digest }}
