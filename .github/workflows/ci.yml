@@ -70,8 +70,8 @@ jobs:
       - name: Build and start
         run: |
           docker network create conker_net || true
-          echo "TOOLGATE_ADMIN_KEY=ci-only-key-not-a-secret-1234" > .env
-          docker compose up -d --build
+          echo "TOOLGATE_ADMIN_KEY=ci-only-key-not-a-secret-1234" > toolgate/.env
+          docker compose -f toolgate/docker-compose.yml up -d --build
           for i in $(seq 1 60); do
             if curl -fsS "http://127.0.0.1:8010/health" >/dev/null 2>&1; then
               echo "healthy after ~${i}s"; exit 0
@@ -79,11 +79,11 @@ jobs:
             sleep 1
           done
           echo "service never became reachable" >&2
-          docker compose logs --tail 50
+          docker compose -f toolgate/docker-compose.yml logs --tail 50
           exit 1
 
       - name: Module contract
         run: python -m pytest toolgate/tests/test_module_contract.py -q
 
       - if: always()
-        run: docker compose down -v
+        run: docker compose -f toolgate/docker-compose.yml down -v
