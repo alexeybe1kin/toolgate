@@ -20,7 +20,9 @@ from pydantic import BaseModel
 
 from toolgate.core import control_plane, planner, research, vault
 
-app = FastAPI(title="ToolGate v2")
+SERVICE_VERSION = "0.2.0"
+
+app = FastAPI(title="ToolGate", version=SERVICE_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in os.environ.get(
@@ -223,7 +225,10 @@ def _probe_http(url: str, path: str) -> dict:
     try:
         response = httpx.get(f"{url.rstrip('/')}{path}", timeout=HEALTH_PROBE_TIMEOUT_SECONDS)
     except httpx.HTTPError as exc:
-        return {"status": "unreachable", "reason": type(exc).__name__}
+        # "unavailable" is the contract's word for configured-but-not-working;
+        # the exception class carries why. Status vocabulary is fixed so one
+        # dashboard can render every module - nuance belongs in reason.
+        return {"status": "unavailable", "reason": type(exc).__name__}
     if response.status_code >= 500:
         return {"status": "degraded", "reason": "upstream_5xx"}
     return {"status": "ok"}
@@ -278,7 +283,12 @@ def health():
     if snapshot is None or now - snapshot["probed_at"] >= HEALTH_CACHE_SECONDS:
         snapshot = {**_run_dependency_checks(), "probed_at": now}
         _health_snapshot = snapshot
-    return {"status": snapshot["status"], "version": "v2", "degraded": snapshot["degraded"],
+    # Field names and order are fixed by the Conker module contract - see
+    # docs/module-contract.md. "version" is this module's own version, not the
+    # API revision: they mean different things, and a dashboard reading one
+    # field for both is wrong about every module it does not special-case.
+    return {"service": "toolgate", "version": SERVICE_VERSION,
+            "status": snapshot["status"], "degraded": snapshot["degraded"],
             "checks": snapshot["checks"], "checked_at": snapshot["checked_at"],
             "age_seconds": round(now - snapshot["probed_at"], 1)}
 

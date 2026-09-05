@@ -84,7 +84,10 @@ class HealthTests(unittest.TestCase):
 
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["degraded"], [])
-        self.assertEqual(body["version"], "v2")
+        # The module contract requires this module's own version, not the API
+        # revision - a dashboard reading one field for both is wrong everywhere.
+        self.assertEqual(body["service"], "toolgate")
+        self.assertEqual(body["version"], server.SERVICE_VERSION)
         self.assertEqual({name: check["status"] for name, check in body["checks"].items()}, {
             "control_plane_db": "ok", "vault": "ok",
             "searxng": "ok", "memorygate": "ok", "planner": "ok",
@@ -102,7 +105,7 @@ class HealthTests(unittest.TestCase):
 
         self.assertEqual(body["status"], "degraded")
         self.assertEqual(body["degraded"], ["memorygate", "planner", "searxng"])
-        self.assertEqual(body["checks"]["searxng"]["status"], "unreachable")
+        self.assertEqual(body["checks"]["searxng"]["status"], "unavailable")
         self.assertEqual(body["checks"]["control_plane_db"]["status"], "ok")
 
     def test_health_reports_degraded_when_the_control_plane_database_is_gone(self):
