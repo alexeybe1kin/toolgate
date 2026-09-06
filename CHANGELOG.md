@@ -5,6 +5,30 @@ things, and a dashboard reading one field for both is wrong about every module
 it does not special-case. A change to the shape of `/health` or any endpoint is
 a contract change and gets its own entry.
 
+## 0.2.2
+
+Secrets no longer ship inside the image.
+
+- **The image carried a real `.env` and a working database.** `COPY toolgate
+  ./toolgate` sweeps the whole package directory, and ToolGate keeps its data
+  *inside* that directory - so every build baked in the admin key, the vault
+  salt, the MemoryGate read key, a GitHub token, a Tavily key, and an 86KB
+  `toolgate.db` of encrypted secrets and audit history. Published that way in
+  0.2.0 and 0.2.1, which are being deleted from the registry; the credentials
+  are being rotated. The gitignore was correct throughout - Docker's `COPY`
+  simply does not read it.
+- **`.dockerignore`, with every pattern anchored `**/`.** The first attempt
+  used a bare `.env`, which matches only the root of the build context. The
+  file that leaked was one level down, so the build looked fixed and leaked
+  exactly as before.
+- **CI builds the image and searches it**, rather than trusting the ignore
+  file still matches after someone moves a path. Scoped to `/app`: a
+  filesystem-wide hunt for `*.pem` matches the OS certificate store, and a
+  check that cries wolf is a check somebody turns off.
+- **`/health` reported `0.2.0` while the module shipped as v0.2.1.** Fixed.
+  Same class of defect as the leak: the code saying something untrue about
+  itself.
+
 ## 0.2.1
 
 Publish workflow only: attestation is skipped while the repository is private,
