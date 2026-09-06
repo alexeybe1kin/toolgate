@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from toolgate.core import control_plane, planner, research, vault
 
-SERVICE_VERSION = "0.2.0"
+SERVICE_VERSION = "0.2.2"
 
 app = FastAPI(title="ToolGate", version=SERVICE_VERSION)
 app.add_middleware(
