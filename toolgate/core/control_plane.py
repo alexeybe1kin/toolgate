@@ -420,12 +420,44 @@ def update_verification_method(method_id: str, changes: dict) -> dict | None:
     return _put("verification_method", method_id, method)
 
 
+# A tool with no ceiling is a tool that can run until something else breaks -
+# the disk, the rate limit of an upstream provider, or the owner's credit. The
+# enforcement has always been here; what was missing was that an absent limit
+# read as "unlimited" rather than as "nobody said, so be careful".
+#
+# Deliberately conservative. A tool that genuinely needs more says so
+# explicitly, which makes it a decision someone made rather than an oversight.
+DEFAULT_USAGE_LIMITS = {
+    "max_per_minute": 6,
+    "max_per_hour": 60,
+    "max_runtime_seconds": 30,
+    "cooldown_seconds": 0,
+}
+
+
+def with_default_limits(policy: dict | None) -> dict:
+    """Fill in any ceiling the caller did not set.
+
+    An explicit value always wins, including a deliberately high one - the
+    point is not to cap what the owner chose, it is that nothing arrives
+    uncapped by accident. `cooldown_seconds` is the exception that may legally
+    be zero, so only genuinely missing keys are filled.
+    """
+    policy = dict(policy or {})
+    limits = dict(policy.get("usage_limits") or {})
+    for name, fallback in DEFAULT_USAGE_LIMITS.items():
+        if limits.get(name) is None:
+            limits[name] = fallback
+    policy["usage_limits"] = limits
+    return policy
+
+
 def create_tool(body: dict) -> dict:
     tool_id = body["id"]
     return _put("tool", tool_id, {"name": body.get("name", tool_id), "description": body.get("description", ""),
         "service_id": body.get("service_id"), "category": body.get("category", "controlled"),
         "inputs": body.get("inputs", []), "outputs": body.get("outputs", []),
-        "execution": body.get("execution", {}), "policy": body.get("policy", {}),
+        "execution": body.get("execution", {}), "policy": with_default_limits(body.get("policy")),
         "authorization": body.get("authorization", "auto"), "version": body.get("version", 1), "status": body.get("status", "active")})
 
 
@@ -439,7 +471,7 @@ def create_automation(body: dict) -> dict:
     automation_id = body["id"]
     return _put("automation", automation_id, {"name": body.get("name", automation_id),
         "description": body.get("description", ""), "inputs": body.get("inputs", []),
-        "workflow": body.get("workflow", []), "policy": body.get("policy", {}),
+        "workflow": body.get("workflow", []), "policy": with_default_limits(body.get("policy")),
         "authorization": body.get("authorization", "auto"), "schedule": body.get("schedule"),
         "version": body.get("version", 1), "status": body.get("status", "draft")})
 
