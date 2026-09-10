@@ -7,6 +7,20 @@ a contract change and gets its own entry.
 
 ## Unreleased
 
+- Close forged verification creation through both generic request endpoints. Only
+  invocation can issue a verification, with immutable issuance provenance.
+- Cancel old unconsumed verifications on upgrade; their origin cannot be trusted.
+  Preserve history and require fresh confirmation. Check provenance again at
+  decision and consumption, including before startup migration has run.
+- Serialize request decisions with consumption and disallow generic request
+  replacement. Creation, decision and consumption commit their audit events in
+  the same transaction. Expired approvals and callback races return conflicts.
+- Bootstrap is insert-only, defaults to no scopes, and preserves narrowed/revoked
+  keys. Editing scopes no longer reactivates a revoked key; mint a new key instead.
+- Extend the mutation drill to ten cases, including forged approvals, a stale
+  decision resurrecting consumption, and bootstrap restoring authority.
+
+
 - Remove `/v2/ai/*`, the AI Builder, planner, automatic AI-draft promotion and
   MCP MemoryGate skill injection. Pi owns cognition.
 - Archive retained AI sessions/proposals and related events transactionally in

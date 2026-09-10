@@ -57,6 +57,7 @@ def startup():
     except (sqlite3.Error, ValueError) as exc:
         raise RuntimeError("AI archive migration failed; keep ToolGate stopped, preserve toolgate.db, "
                            "and inspect the migration error before retrying") from exc
+    control_plane.invalidate_legacy_verifications()
     generated = vault.ensure_control_keys()
     for name in generated:
         print(f"[toolgate] generated and persisted {name}; value intentionally not logged")
@@ -69,7 +70,7 @@ def startup():
         print(f"[toolgate] encrypted {moved} vault value(s) at rest; values intentionally not logged")
     bootstrap_key = os.environ.get("TOOLGATE_BOOTSTRAP_EXECUTION_KEY", "").strip()
     if bootstrap_key:
-        scopes = [scope.strip() for scope in os.environ.get("TOOLGATE_BOOTSTRAP_SCOPES", "tool:*,automation:*").split(",") if scope.strip()]
+        scopes = [scope.strip() for scope in os.environ.get("TOOLGATE_BOOTSTRAP_SCOPES", "").split(",") if scope.strip()]
         control_plane.ensure_bootstrap_agent_key(bootstrap_key, scopes)
     ensure_builtin_research_capabilities()
 
@@ -407,6 +408,8 @@ class V2Automation(BaseModel):
 
 
 class V2Request(BaseModel):
+    """Informational owner messages; verification is issued only by an invocation."""
+
     kind: str
     title: str
     details: str
@@ -1321,8 +1324,13 @@ def verification_callback(payload: VerificationCallback,
         deny("CALLBACK_NONCE_INVALID", "Callback nonce does not match this request", 409)
     if payload.decision not in {"approved", "rejected"}:
         raise HTTPException(422, "decision must be approved or rejected")
-    record = control_plane.decide_request(payload.request_id, payload.decision,
-                                          f"callback:{method['name']}")
+    try:
+        record = control_plane.decide_request(payload.request_id, payload.decision,
+                                              f"callback:{method['name']}")
+    except ValueError as exc:
+        deny("REQUEST_NOT_PENDING", str(exc), 409, "Refresh the request; do not retry a decided or expired approval")
+    if not record:
+        deny("REQUEST_NOT_PENDING", "Verification request no longer exists", 409, "Request fresh confirmation")
     control_plane.update_verification_method(method["id"], {"last_seen_at": datetime.now(timezone.utc).isoformat()})
     control_plane.event("verification_callback_accepted", "info", "verification_method",
                         method["id"], "callback", {"request_id": payload.request_id,
@@ -1589,8 +1597,11 @@ def create_agent_request(payload: V2Request, agent: dict = Depends(require_agent
         deny("LOCKED_DOWN", "ToolGate is in lockdown mode", 423)
     if payload.kind == "ai_draft":
         deny("AI_DRAFT_RETIRED", "AI drafts belong in Pi", 410, "Use the owner tools API to register a reviewed capability")
-    return control_plane.create_request(payload.kind, payload.title, payload.details, agent["name"],
-                                        {**payload.payload, "created_by_agent_key": agent["id"]}, payload.severity)
+    try:
+        return control_plane.create_request(payload.kind, payload.title, payload.details, agent["name"],
+                                            {**payload.payload, "created_by_agent_key": agent["id"]}, payload.severity)
+    except ValueError as exc:
+        deny("REQUEST_KIND_INVALID", str(exc), 422, "Invoke the exact tool or automation to request confirmation")
 
 
 @app.get("/v2/agent/requests/{request_id}")
@@ -1607,7 +1618,10 @@ def agent_request_status(request_id: str, agent: dict = Depends(require_agent)):
 def create_admin_request(payload: V2Request, _tier: str = Depends(require_admin)):
     if payload.kind == "ai_draft":
         deny("AI_DRAFT_RETIRED", "AI drafts belong in Pi", 410, "Use the owner tools API to register a reviewed capability")
-    return control_plane.create_request(payload.kind, payload.title, payload.details, "admin", payload.payload, payload.severity)
+    try:
+        return control_plane.create_request(payload.kind, payload.title, payload.details, "admin", payload.payload, payload.severity)
+    except ValueError as exc:
+        deny("REQUEST_KIND_INVALID", str(exc), 422, "Invoke the exact tool or automation to request confirmation")
 
 
 @app.post("/v2/requests/{request_id}/decision")

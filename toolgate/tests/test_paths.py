@@ -37,7 +37,7 @@ class RuntimePathsTests(unittest.TestCase):
         importlib.reload(paths)
         importlib.reload(control_plane)
 
-    def test_bootstrap_agent_key_updates_deployment_scopes(self):
+    def test_bootstrap_agent_key_does_not_reconcile_deployment_scopes(self):
         from toolgate.core import control_plane
 
         with tempfile.TemporaryDirectory() as root, patch.dict(
@@ -49,7 +49,7 @@ class RuntimePathsTests(unittest.TestCase):
             first = reloaded.ensure_bootstrap_agent_key("tgx_test_bootstrap_key_123", ["tool:*"])
             second = reloaded.ensure_bootstrap_agent_key("tgx_test_bootstrap_key_123", ["tool:research.*"])
             self.assertEqual(first["id"], second["id"])
-            self.assertEqual(reloaded.authenticate_agent("tgx_test_bootstrap_key_123")["scopes"], ["tool:research.*"])
+            self.assertEqual(reloaded.authenticate_agent("tgx_test_bootstrap_key_123")["scopes"], ["tool:*"])
         importlib.reload(paths)
         importlib.reload(control_plane)
 

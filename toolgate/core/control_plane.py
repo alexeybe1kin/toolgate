@@ -37,6 +37,9 @@ def _conn():
       scopes TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
       last_used_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS v2_verification_origins (
+      request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS v2_events (
       id TEXT PRIMARY KEY, event_type TEXT NOT NULL, severity TEXT NOT NULL,
       subject_type TEXT, subject_id TEXT, actor TEXT, payload TEXT NOT NULL,
@@ -77,7 +80,11 @@ def _put(kind: str, obj_id: str, body: dict) -> dict:
     now = _now()
     body = {**body, "id": obj_id}
     with _conn() as conn:
+        if kind == "request":
+            conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute("SELECT created_at FROM v2_objects WHERE kind=? AND id=?", (kind, obj_id)).fetchone()
+        if kind == "request" and existing:
+            raise ValueError("Requests cannot be replaced; use the serialized decision or consumption transition")
         created = existing["created_at"] if existing else now
         conn.execute(
             "INSERT INTO v2_objects(kind,id,body,created_at,updated_at) VALUES(?,?,?,?,?) "
@@ -216,49 +223,28 @@ def issue_agent_key(name: str, scopes: list[str]) -> tuple[dict, str]:
 
 
 def ensure_bootstrap_agent_key(raw: str, scopes: list[str], name: str = "AgentGate Pi") -> dict:
-    """Seed one explicit deployment key without ever persisting its raw value."""
+    """Seed a missing deployment key; never reconcile an existing key to configuration."""
     if not raw.startswith("tgx_") or len(raw) < 20:
         raise ValueError("TOOLGATE_BOOTSTRAP_EXECUTION_KEY must start with tgx_ and be at least 20 characters")
     hashed = hashlib.sha256(raw.encode()).hexdigest()
     normalized_scopes = scopes or []
-    updated_record: sqlite3.Row | None = None
     created_record: dict | None = None
     with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute("SELECT * FROM v2_agent_keys WHERE key_hash=?", (hashed,)).fetchone()
         if existing:
-            current = json.loads(existing["scopes"]) if isinstance(existing["scopes"], str) else existing["scopes"]
-            if current != normalized_scopes:
-                conn.execute(
-                    "UPDATE v2_agent_keys SET scopes=?, status='active' WHERE id=?",
-                    (json.dumps(normalized_scopes), existing["id"]),
-                )
-                existing = conn.execute("SELECT * FROM v2_agent_keys WHERE id=?", (existing["id"],)).fetchone()
-                updated_record = existing
-            result = public_agent_key(existing)
-        else:
-            record = {
-                "id": str(uuid.uuid4()),
-                "name": name,
-                "key_hash": hashed,
-                "scopes": normalized_scopes,
-                "status": "active",
-                "created_at": _now(),
-            }
-            conn.execute(
-                "INSERT INTO v2_agent_keys(id,name,key_hash,scopes,status,created_at) VALUES(?,?,?,?,?,?)",
-                (record["id"], record["name"], record["key_hash"], json.dumps(record["scopes"]), record["status"], record["created_at"]),
-            )
-            created_record = record
-            result = public_agent_key(record)
-    if updated_record:
-        event(
-            "agent_key_bootstrap_scopes_updated",
-            "info",
-            "agent_key",
-            updated_record["id"],
-            "deployment",
-            {"name": name, "scopes": normalized_scopes},
+            # Deployment configuration seeds authority; the owner's persisted decisions govern it thereafter.
+            return public_agent_key(existing)
+        record = {
+            "id": str(uuid.uuid4()), "name": name, "key_hash": hashed,
+            "scopes": normalized_scopes, "status": "active", "created_at": _now(),
+        }
+        conn.execute(
+            "INSERT INTO v2_agent_keys(id,name,key_hash,scopes,status,created_at) VALUES(?,?,?,?,?,?)",
+            (record["id"], record["name"], record["key_hash"], json.dumps(record["scopes"]), record["status"], record["created_at"]),
         )
+        created_record = record
+        result = public_agent_key(record)
     if created_record:
         event("agent_key_bootstrapped", "info", "agent_key", created_record["id"], "deployment", {"name": name, "scopes": normalized_scopes})
     return result
@@ -285,7 +271,7 @@ def update_agent_key_scopes(key_id: str, scopes: list[str], actor: str = "admin"
         if not row:
             return None
         conn.execute(
-            "UPDATE v2_agent_keys SET scopes=?, status='active' WHERE id=?",
+            "UPDATE v2_agent_keys SET scopes=? WHERE id=?",
             (json.dumps(normalized), key_id),
         )
         updated = conn.execute("SELECT * FROM v2_agent_keys WHERE id=?", (key_id,)).fetchone()
@@ -486,15 +472,87 @@ def update_automation(automation_id: str, body: dict) -> dict | None:
 
 
 
+# These requests are messages to the owner, never execution credentials.
+INFORMATIONAL_REQUEST_KINDS = frozenset({
+    "create-tool", "create-automation", "edit", "delete", "secret",
+    "warning", "update", "suggestion", "info",
+})
+
+
+def _insert_request(conn: sqlite3.Connection, record: dict) -> dict:
+    now = _now()
+    record = {**record, "id": str(uuid.uuid4()), "status": "pending"}
+    conn.execute("INSERT INTO v2_objects(kind,id,body,created_at,updated_at) VALUES('request',?,?,?,?)",
+                 (record["id"], json.dumps(record), now, now))
+    _request_event(conn, "request_created", record["severity"], record["id"], record["actor"],
+                   {"kind": record["kind"], "title": record["title"]})
+    return {**record, "created_at": now, "updated_at": now}
+
+
+def _request_event(conn: sqlite3.Connection, event_type: str, severity: str,
+                   request_id: str, actor: str, payload: dict) -> None:
+    # A committed transition without its audit event is an incomplete account of authority.
+    conn.execute("INSERT INTO v2_events VALUES(?,?,?,?,?,?,?,?)",
+                 (str(uuid.uuid4()), event_type, severity, "request", request_id,
+                  actor, json.dumps(payload), _now()))
+
+
 def create_request(kind: str, title: str, details: str, actor: str, payload: dict | None = None,
                    severity: str = "info") -> dict:
-    if kind == "ai_draft":
-        raise ValueError("AI drafts are retired; use Pi for planning and the owner tools API for registration")
-    request_id = str(uuid.uuid4())
-    record = _put("request", request_id, {"kind": kind, "title": title, "details": details,
-        "actor": actor, "payload": payload or {}, "severity": severity, "status": "pending"})
-    event("request_created", severity, "request", request_id, actor, {"kind": kind, "title": title})
-    return record
+    if kind not in INFORMATIONAL_REQUEST_KINDS:
+        raise ValueError("Request kind is not informational; request execution through the tool invoke or automation run endpoint")
+    with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        return _insert_request(conn, {"kind": kind, "title": title, "details": details,
+                                     "actor": actor, "payload": payload or {}, "severity": severity})
+
+
+def _verification_fingerprint(record: dict) -> str:
+    payload = {**record.get("payload", {})}
+    payload["binding"] = {key: value for key, value in payload.get("binding", {}).items()
+                          if key not in {"consumed_at", "consumed_by"}}
+    immutable = {key: record.get(key) for key in ("id", "kind", "title", "details", "actor", "severity")}
+    immutable["payload"] = payload
+    return hashlib.sha256(json.dumps(immutable, sort_keys=True, separators=(",", ":"),
+                                    ensure_ascii=True).encode()).hexdigest()
+
+
+def _verification_origin_valid(conn: sqlite3.Connection, record: dict) -> bool:
+    origin = conn.execute("SELECT fingerprint FROM v2_verification_origins WHERE request_id=?",
+                          (record["id"],)).fetchone()
+    return bool(origin and secrets.compare_digest(origin[0], _verification_fingerprint(record)))
+
+
+def invalidate_legacy_verifications() -> int:
+    """Old records may be forged; preserving their text is not permission to use them."""
+    changed = 0
+    with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute("SELECT * FROM v2_objects WHERE kind='request'").fetchall()
+        for row in rows:
+            record = _row(row)
+            binding = record.get("payload", {}).get("binding")
+            consumed = isinstance(binding, dict) and binding.get("consumed_at")
+            if (record.get("kind") != "verification" or record.get("status") not in {"pending", "approved"}
+                    or (record.get("status") == "approved" and consumed)
+                    or _verification_origin_valid(conn, record)):
+                continue
+            record["status"] = "cancelled"
+            record["decision"] = {"actor": "system", "at": _now(),
+                                  "note": "Untrusted legacy approval; request fresh confirmation through the invoke path"}
+            _save_request(conn, record)
+            _request_event(conn, "verification_invalidated", "warning", record["id"], "system",
+                           {"reason": "untrusted issuance"})
+            changed += 1
+    return changed
+
+
+def _save_request(conn: sqlite3.Connection, record: dict) -> None:
+    now = _now()
+    conn.execute("UPDATE v2_objects SET body=?,updated_at=? WHERE kind='request' AND id=?",
+                 (json.dumps({key: value for key, value in record.items()
+                              if key not in {"created_at", "updated_at"}}), now, record["id"]))
+    record["updated_at"] = now
 
 
 def action_digest(subject_type: str, subject_id: str, args: dict, version: int | None = None) -> str:
@@ -517,19 +575,26 @@ def create_verification_request(title: str, details: str, actor: str, subject_ty
         "expires_at": expiry.isoformat(),
         "consumed_at": None,
     }
-    return create_request("verification", title, details, actor,
-                          {"subject_type": subject_type, "subject_id": subject_id,
-                           "args": args, "binding": binding,
-                           "created_by_agent_key": actor_id}, "warning")
+    with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        record = _insert_request(conn, {
+            "kind": "verification", "title": title, "details": details, "actor": actor,
+            "payload": {"subject_type": subject_type, "subject_id": subject_id,
+                        "args": args, "binding": binding, "created_by_agent_key": actor_id},
+            "severity": "warning",
+        })
+        conn.execute("INSERT INTO v2_verification_origins(request_id,fingerprint) VALUES(?,?)",
+                     (record["id"], _verification_fingerprint(record)))
+        return record
 
 
 def consume_verification(request_id: str, subject_type: str, subject_id: str,
                          args: dict, version: int | None, actor: str,
                          actor_id: str | None = None) -> tuple[bool, str]:
     """Atomically consume an approved action binding exactly once."""
-    now = datetime.now(timezone.utc)
     with _conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        now = datetime.now(timezone.utc)
         row = conn.execute("SELECT * FROM v2_objects WHERE kind='request' AND id=?", (request_id,)).fetchone()
         if not row:
             return False, "Approval request was not found"
@@ -537,14 +602,18 @@ def consume_verification(request_id: str, subject_type: str, subject_id: str,
         binding = record.get("payload", {}).get("binding", {})
         if record.get("kind") != "verification" or record.get("status") != "approved":
             return False, f"Approval request is {record.get('status', 'invalid')}"
+        if not _verification_origin_valid(conn, record):
+            return False, "Approval was not issued intact by ToolGate; request fresh confirmation"
         created_by = record.get("payload", {}).get("created_by_agent_key")
-        if created_by and actor_id != created_by:
+        if not created_by or actor_id != created_by:
             return False, "Approval request belongs to a different originating agent"
         if binding.get("consumed_at"):
             return False, "Approval request has already been consumed"
         try:
             expires_at = datetime.fromisoformat(binding["expires_at"])
         except (KeyError, TypeError, ValueError):
+            return False, "Approval request has an invalid expiry"
+        if expires_at.tzinfo is None:
             return False, "Approval request has an invalid expiry"
         if expires_at <= now:
             return False, "Approval request has expired"
@@ -554,23 +623,36 @@ def consume_verification(request_id: str, subject_type: str, subject_id: str,
         binding["consumed_at"] = now.isoformat()
         binding["consumed_by"] = actor
         record["payload"]["binding"] = binding
-        conn.execute("UPDATE v2_objects SET body=?,updated_at=? WHERE kind='request' AND id=?",
-                     (json.dumps({key: value for key, value in record.items()
-                                  if key not in {"created_at", "updated_at"}}), now.isoformat(), request_id))
-    event("verification_consumed", "info", "request", request_id, actor,
-          {"subject_type": subject_type, "subject_id": subject_id})
+        _save_request(conn, record)
+        _request_event(conn, "verification_consumed", "info", request_id, actor,
+                       {"subject_type": subject_type, "subject_id": subject_id})
     return True, "approved"
 
 
 def decide_request(request_id: str, status: str, actor: str, note: str = "") -> dict | None:
-    record = get("request", request_id)
-    if not record:
-        return None
-    if record.get("status") != "pending":
-        raise ValueError(f"request is already {record.get('status')}")
-    record["status"] = status
-    record["decision"] = {"actor": actor, "note": note, "at": _now()}
-    record = _put("request", request_id, record)
-    event("request_decided", "info" if status == "approved" else "warning", "request", request_id, actor,
-          {"status": status})
+    if status not in {"approved", "rejected", "dismissed"}:
+        raise ValueError("Decision must be approved, rejected, or dismissed")
+    with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM v2_objects WHERE kind='request' AND id=?", (request_id,)).fetchone()
+        if not row:
+            return None
+        record = _row(row)
+        if record.get("status") != "pending":
+            raise ValueError(f"request is already {record.get('status')}")
+        if record.get("kind") == "verification":
+            if not _verification_origin_valid(conn, record):
+                raise ValueError("Approval was not issued intact by ToolGate; request fresh confirmation")
+            if status == "approved":
+                try:
+                    expires_at = datetime.fromisoformat(record["payload"]["binding"]["expires_at"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("Approval expiry is invalid; request fresh confirmation") from exc
+                if expires_at.tzinfo is None or expires_at <= datetime.now(timezone.utc):
+                    raise ValueError("Approval has expired; request fresh confirmation")
+        record["status"] = status
+        record["decision"] = {"actor": actor, "note": note, "at": _now()}
+        _save_request(conn, record)
+        _request_event(conn, "request_decided", "info" if status == "approved" else "warning",
+                       request_id, actor, {"status": status})
     return record

@@ -1,4 +1,4 @@
-"""Prove A2/B5 tests detect broken authority and archival, in disposable copies.
+"""Prove boundary tests detect broken authority, archival and approval integrity, in disposable copies.
 
 Run from the repository root: python toolgate/scripts/mutation_check.py
 No live source, database, vault, or gate configuration is modified.
@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 MCP = "toolgate/tests/test_mcp_adapter.py::"
 ARCHIVE = "toolgate/tests/test_execution_boundary.py::"
+INTEGRITY = "toolgate/tests/test_approval_integrity.py::"
 
 # A mutant counts as caught only when its named behavioral test fails, never
 # when collection fails or the subprocess cannot start.
@@ -67,6 +68,39 @@ MUTANTS = [
         "follow_redirects=False",
         "follow_redirects=True",
         MCP + "test_transport_never_follows_redirects_or_retries[302]",
+    ),
+    (
+        "forged verification accepted through generic requests",
+        "toolgate/core/control_plane.py",
+        "if kind not in INFORMATIONAL_REQUEST_KINDS:",
+        'if kind not in INFORMATIONAL_REQUEST_KINDS and kind != "verification":',
+        INTEGRITY + "test_execution_key_cannot_forge_approval_text_or_binding",
+    ),
+    (
+        "stale decision overwrites consumption",
+        "toolgate/core/control_plane.py",
+        """    with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM v2_objects WHERE kind='request' AND id=?", (request_id,)).fetchone()
+        if not row:
+            return None
+        record = _row(row)
+        if record.get("status") != "pending":""",
+        """    record = get("request", request_id)
+    if not record:
+        return None
+    with _conn() as conn:
+        if record.get("status") != "pending":""",
+        INTEGRITY + "test_late_decision_cannot_restore_a_consumed_token",
+    ),
+    (
+        "bootstrap resurrects revoked authority",
+        "toolgate/core/control_plane.py",
+        "            return public_agent_key(existing)",
+        """            conn.execute("UPDATE v2_agent_keys SET scopes=?,status='active' WHERE id=?",
+                         (json.dumps(normalized_scopes), existing["id"]))
+            return public_agent_key(conn.execute("SELECT * FROM v2_agent_keys WHERE id=?", (existing["id"],)).fetchone())""",
+        INTEGRITY + "test_restart_never_widens_or_revives_bootstrap_key",
     ),
 ]
 

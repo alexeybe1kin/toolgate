@@ -46,6 +46,9 @@ The dashboard includes a command center, live execution activity, services, tool
 - Rate, cooldown, runtime, workflow-step, destination, response-size, loop, retry, and delay ceilings are enforced in code.
 - Sensitive actions bind approval to the exact object type, object ID, version, argument digest, nonce, and expiry.
 - An approval is atomically consumed once. Replays and changed arguments fail closed.
+- Verification requests originate only from invocation. Generic agent and admin requests are informational and cannot mint execution approvals.
+- Decisions and consumption serialize against the same SQLite writer lock; each request transition commits its audit event atomically.
+- Deployment bootstrap seeds missing keys with no scopes by default. Restart never changes existing scopes or revocation state.
 - Signed verification callbacks use HMAC-SHA256, a 60-second timestamp window, a per-request nonce, and immutable action binding.
 - Lockdown blocks agent execution, new agent requests, verification callbacks, and ToolGate-mediated MemoryGate access.
 - Logs and API responses contain references and redacted outcomes, never injected secret values.
@@ -230,6 +233,10 @@ The default internal endpoints are:
 - Ollama: `http://memorygate-ollama:11434`
 
 They can be changed with owner-controlled environment settings without exposing the destination to agent arguments.
+
+Upgrading to the approval-integrity fix cancels old unconsumed verification requests.
+Their issuance could have been forged; request fresh confirmation through the invoke
+path. History is retained. See [approval integrity and upgrade notes](docs/APPROVAL_INTEGRITY.md).
 
 ## Verification Callback
 

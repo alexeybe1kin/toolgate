@@ -138,15 +138,12 @@ class ApprovalBoundaryTests(unittest.TestCase):
     def test_an_expired_approval_is_refused(self):
         request_id = self.mint()
         self.approve(request_id)
-        record = control_plane.get("request", request_id)
-        # Ages the stored binding rather than sleeping out the 15 second floor
-        # that create_verification_request clamps every expiry to.
-        record["payload"]["binding"]["expires_at"] = (
-            datetime.now(timezone.utc) - timedelta(seconds=1)
-        ).isoformat()
-        control_plane._put("request", request_id, record)
-
-        self.assert_denied(self.invoke(self.agent_key, "hello", request_id), "has expired")
+        # Advance time without rewriting an immutable approval or sleeping out its lifetime.
+        future = datetime.now(timezone.utc) + timedelta(seconds=901)
+        with patch("toolgate.core.control_plane.datetime") as clock:
+            clock.now.return_value = future
+            clock.fromisoformat.side_effect = datetime.fromisoformat
+            self.assert_denied(self.invoke(self.agent_key, "hello", request_id), "has expired")
 
     def test_concurrent_consumption_succeeds_exactly_once(self):
         request_id = self.mint()

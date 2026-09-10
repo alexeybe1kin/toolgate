@@ -2623,7 +2623,8 @@
           "title",
           "details"
         ],
-        "title": "V2Request"
+        "title": "V2Request",
+        "description": "Informational owner messages; verification is issued only by an invocation."
       },
       "V2RequestDecision": {
         "properties": {
