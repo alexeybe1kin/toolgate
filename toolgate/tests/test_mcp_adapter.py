@@ -1,127 +1,261 @@
-import contextlib
-import io
-import unittest
-from unittest.mock import patch
+"""Drive stdio and its real HTTP action path against SQLite, not mocked authority."""
 
-from toolgate.mcp import toolgate_mcp
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+import uvicorn
+
+from toolgate.api import server
+from toolgate.core import control_plane, vault
+from toolgate.mcp import toolgate_mcp as bridge
 
 
-class ToolGateMcpTests(unittest.TestCase):
-    def test_tool_input_schema_includes_limits_and_approval(self):
-        tool = {
-            "id": "sample",
+@pytest.fixture
+def boundary(tmp_path, monkeypatch):
+    monkeypatch.setattr(control_plane, "DB_PATH", tmp_path / "gate.db")
+    monkeypatch.setattr(vault, "ENV_PATH", tmp_path / "vault.env")
+    monkeypatch.setenv("TOOLGATE_ADMIN_KEY", "owner-test-key")
+    for tool_id in ("allowed.echo", "secret.echo"):
+        control_plane.create_tool(
+            {
+                "id": tool_id,
+                "name": tool_id,
+                "status": "active",
+                "authorization": "auto",
+                "inputs": [{"name": "value", "type": "string", "required": True}],
+                "execution": {"type": "echo"},
+                "policy": {
+                    "usage_limits": {
+                        "max_per_minute": 1000,
+                        "max_per_hour": 1000,
+                        "cooldown_seconds": 0,
+                    }
+                },
+            }
+        )
+    agent, key = control_plane.issue_agent_key("scoped caller", ["tool:allowed.echo"])
+    other, other_key = control_plane.issue_agent_key("other caller", ["tool:*"])
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    api = uvicorn.Server(uvicorn.Config(server.app, lifespan="off", log_level="error"))
+    thread = threading.Thread(target=api.run, kwargs={"sockets": [sock]}, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not api.started and thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert api.started, "local ToolGate HTTP server did not start"
+    monkeypatch.setenv("TOOLGATE_URL", url)
+    monkeypatch.setenv("TOOLGATE_EXECUTION_KEY", key)
+    yield {
+        "url": url,
+        "key": key,
+        "agent": agent,
+        "other_key": other_key,
+        "other": other,
+    }
+    api.should_exit = True
+    thread.join(timeout=10)
+    sock.close()
+    assert not thread.is_alive()
+
+
+def call(tool_id="allowed.echo", value="hello", approval=None):
+    body = {"args": {"value": value}}
+    if approval:
+        body["approval_request_id"] = approval
+    return bridge._invoke(bridge._mcp_tool_name(tool_id), body)
+
+
+def test_scoped_catalogue_and_direct_call_cannot_escape(boundary):
+    names = {tool["name"] for tool in bridge.list_tools()}
+    assert bridge._mcp_tool_name("allowed.echo") in names
+    assert bridge._mcp_tool_name("secret.echo") not in names
+    assert call()["code"] == "OK"
+    with pytest.raises(RuntimeError, match="unavailable"):
+        call("secret.echo")
+    # A client skipping discovery still meets the same server-side scope check.
+    with pytest.raises(RuntimeError, match="403"):
+        bridge._request(
+            "POST", "/v2/tools/secret.echo/invoke", {"args": {"value": "hello"}}
+        )
+    assert not any(
+        event["subject_id"] == "secret.echo"
+        for event in control_plane.events(100)
+        if event["event_type"] == "tool_executed"
+    )
+
+
+def test_revocation_and_scope_changes_take_effect_without_restart(boundary):
+    assert call()["code"] == "OK"
+    control_plane.update_agent_key_scopes(boundary["agent"]["id"], [])
+    with pytest.raises(RuntimeError, match="unavailable"):
+        call()
+    control_plane.revoke_agent_key(boundary["agent"]["id"])
+    with pytest.raises(RuntimeError, match="401"):
+        bridge.list_tools()
+
+
+def test_approvals_keep_identity_arguments_and_single_consumption(
+    boundary, monkeypatch
+):
+    tool = control_plane.get("tool", "allowed.echo")
+    control_plane.create_tool({**tool, "authorization": "owner_confirmation"})
+    pending = call()
+    assert pending["code"] == "CONFIRMATION_REQUIRED"
+    request_id = pending["request_id"]
+    record = control_plane.get("request", request_id)
+    assert record["payload"]["created_by_agent_key"] == boundary["agent"]["id"]
+    assert (
+        bridge._invoke("toolgate_request_status", {"request_id": request_id})["status"]
+        == "pending"
+    )
+    control_plane.decide_request(request_id, "approved", "admin")
+    monkeypatch.setenv("TOOLGATE_EXECUTION_KEY", boundary["other_key"])
+    with pytest.raises(RuntimeError, match="404"):
+        bridge._invoke("toolgate_request_status", {"request_id": request_id})
+    with pytest.raises(RuntimeError, match="409"):
+        call(approval=request_id)
+    monkeypatch.setenv("TOOLGATE_EXECUTION_KEY", boundary["key"])
+    with pytest.raises(RuntimeError, match="409"):
+        call(value="changed", approval=request_id)
+    assert call(approval=request_id)["code"] == "OK"
+    with pytest.raises(RuntimeError, match="409"):
+        call(approval=request_id)
+    executed = [
+        e for e in control_plane.events(100) if e["event_type"] == "tool_executed"
+    ]
+    assert len(executed) == 1
+    assert executed[0]["actor"] == "scoped caller"
+
+
+def test_lockdown_and_limits_apply_to_mcp(boundary):
+    tool = control_plane.get("tool", "allowed.echo")
+    control_plane.create_tool(
+        {**tool, "policy": {"usage_limits": {"max_per_minute": 1}}}
+    )
+    assert call()["code"] == "OK"
+    with pytest.raises(RuntimeError, match="429"):
+        call()
+    control_plane.set_lockdown(True, "admin", "drill")
+    with pytest.raises(RuntimeError, match="423"):
+        call()
+
+
+def run_stdio(messages, env=None):
+    return subprocess.run(
+        [sys.executable, str(Path(bridge.__file__).resolve())],
+        input="".join(json.dumps(message) + "\n" for message in messages),
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=15,
+        check=False,
+    )
+
+
+def test_stdio_requires_execution_key_even_when_admin_key_exists(monkeypatch):
+    monkeypatch.delenv("TOOLGATE_EXECUTION_KEY", raising=False)
+    monkeypatch.setenv("TOOLGATE_ADMIN_KEY", "not-an-execution-key")
+    result = run_stdio([])
+    assert result.returncode == 2
+    assert "Set TOOLGATE_EXECUTION_KEY" in result.stderr
+    assert not result.stdout
+
+
+def test_stdio_lists_and_executes_through_http_without_local_state(boundary):
+    env = dict(
+        os.environ,
+        TOOLGATE_DATA_DIR="Z:/unavailable-state",
+        TOOLGATE_ENV_PATH="Z:/no-vault",
+    )
+    result = run_stdio(
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": bridge._mcp_tool_name("allowed.echo"),
+                    "arguments": {"args": {"value": "from stdio"}},
+                },
+            },
+        ],
+        env,
+    )
+    assert result.returncode == 0, result.stderr
+    responses = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [r["id"] for r in responses] == [1, 2, 3]
+    assert len(responses[1]["result"]["tools"]) == 2
+    assert json.loads(responses[2]["result"]["content"][0]["text"])["code"] == "OK"
+
+
+def test_invalid_and_admin_keys_are_not_execution_credentials(boundary, monkeypatch):
+    for key in ("invalid", "owner-test-key"):
+        monkeypatch.setenv("TOOLGATE_EXECUTION_KEY", key)
+        with pytest.raises(RuntimeError, match="401"):
+            bridge.list_tools()
+
+
+def test_input_envelope_preserves_a_tool_argument_named_approval_request_id():
+    schema = bridge._tool_input_schema(
+        {
             "inputs": [
-                {"name": "query", "type": "string", "required": True, "min_length": 2, "max_length": 20},
-                {"name": "count", "type": "integer", "minimum": 1, "maximum": 5, "default": 3},
-                {"name": "tags", "type": "array", "item_type": "string", "item_pattern": "^[a-z]+$", "unique_items": True},
-            ],
+                {"name": "approval_request_id", "type": "string", "required": True}
+            ]
         }
-
-        schema = toolgate_mcp._tool_input_schema(tool)
-
-        self.assertEqual("object", schema["type"])
-        self.assertEqual(["query"], schema["required"])
-        self.assertEqual(2, schema["properties"]["query"]["minLength"])
-        self.assertEqual(5, schema["properties"]["count"]["maximum"])
-        self.assertEqual(3, schema["properties"]["count"]["default"])
-        self.assertEqual("string", schema["properties"]["tags"]["items"]["type"])
-        self.assertTrue(schema["properties"]["tags"]["uniqueItems"])
-        self.assertIn("approval_request_id", schema["properties"])
-
-    def test_mcp_tool_name_maps_punctuated_ids_to_safe_names(self):
-        self.assertEqual(
-            "research_search",
-            toolgate_mcp._mcp_tool_name("research.search", ["research.search"]),
-        )
-
-    @patch("toolgate.mcp.toolgate_mcp._bootstrap")
-    @patch("toolgate.mcp.toolgate_mcp.control_plane.list_objects")
-    def test_list_tools_uses_active_control_plane_objects(self, list_objects, _bootstrap):
-        list_objects.return_value = [{
-            "id": "memorygate.context",
-            "description": "Read memory through ToolGate",
-            "status": "active",
-            "inputs": [{"name": "query", "type": "string", "required": True}],
-            "authorization": "auto",
-        }]
-
-        tools = toolgate_mcp.list_tools()
-
-        self.assertEqual("memorygate_context", tools[0]["name"])
-        self.assertIn("ToolGate id: memorygate.context.", tools[0]["description"])
-        self.assertEqual("toolgate_request_status", tools[-1]["name"])
-
-    @patch.dict("os.environ", {}, clear=False)
-    @patch("toolgate.mcp.toolgate_mcp._request_memorygate_skills")
-    def test_skill_injection_is_absent_when_flag_off(self, request_skills):
-        toolgate_mcp._SKILL_CACHE.clear()
-        tool = {"id": "payments.charge", "description": "Charge money", "inputs": []}
-
-        result = toolgate_mcp._tool_to_mcp(tool)
-
-        self.assertNotIn("Linked MemoryGate skills", result["description"])
-        request_skills.assert_not_called()
-
-    @patch.dict("os.environ", {"TOOLGATE_SKILL_INJECTION": "1"}, clear=False)
-    @patch("toolgate.mcp.toolgate_mcp._request_memorygate_skills")
-    def test_skill_injection_appends_linked_skill_when_flag_on(self, request_skills):
-        toolgate_mcp._SKILL_CACHE.clear()
-        request_skills.return_value = [{
-            "title": "Approval discipline",
-            "version": "2",
-            "body": "Check amount and recipient before invoking.",
-        }]
-        tool = {"id": "payments.charge", "description": "Charge money", "inputs": []}
-
-        result = toolgate_mcp._tool_to_mcp(tool)
-
-        self.assertIn("Linked MemoryGate skills", result["description"])
-        self.assertIn("Approval discipline (v2)", result["description"])
-        self.assertIn("Check amount and recipient before invoking.", result["description"])
-
-    @patch("toolgate.mcp.toolgate_mcp._bootstrap")
-    @patch("toolgate.mcp.toolgate_mcp._server_module")
-    @patch("toolgate.mcp.toolgate_mcp.control_plane.list_objects")
-    def test_invoke_uses_server_execution_path(self, list_objects, server_module, _bootstrap):
-        tool = {"id": "memorygate.context", "status": "active", "inputs": []}
-        list_objects.return_value = [tool]
-        server_module.return_value.invoke_tool.return_value = {"code": "OK", "result": {"ok": True, "result": {"items": []}}}
-
-        result = toolgate_mcp._invoke("memorygate_context", {"approval_request_id": "req-1"})
-
-        self.assertEqual("OK", result["code"])
-        server_module.return_value.invoke_tool.assert_called_once_with(
-            tool,
-            {},
-            "Operator console",
-            approval_request_id="req-1",
-            actor_id="local-mcp",
-        )
-
-    @patch("toolgate.mcp.toolgate_mcp.control_plane.list_objects")
-    def test_the_bridge_exposes_every_active_tool_with_no_scope_filter(self, list_objects):
-        # Asserted, not lamented: this bridge has no execution key and therefore
-        # no agent to scope against, which is exactly why it is single-operator
-        # only. See the module docstring and docs/SINGLE_OPERATOR_MCP_BRIDGE.md.
-        list_objects.return_value = [
-            {"id": "research.search", "status": "active", "inputs": []},
-            {"id": "payments.transfer", "status": "active", "inputs": []},
-            {"id": "retired.tool", "status": "disabled", "inputs": []},
-        ]
-
-        visible = [tool["id"] for tool in toolgate_mcp._visible_tools()]
-
-        self.assertEqual(visible, ["research.search", "payments.transfer"])
-
-    def test_the_bridge_warns_on_stdout_of_the_client_that_it_has_no_scope(self):
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr), patch("sys.stdin", io.StringIO("")):
-            toolgate_mcp.main()
-
-        warning = stderr.getvalue()
-        self.assertIn("no scope check", warning)
-        self.assertIn("Do not attach an autonomous agent", warning)
+    )
+    assert "approval_request_id" in schema["properties"]["args"]["properties"]
+    assert schema["properties"]["args"]["required"] == ["approval_request_id"]
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_names_do_not_alias_when_scope_changes():
+    ids = ["a.b", "a_b", "1abc", "tool_1abc", "toolgate_request_status", "x" * 100]
+    ids.append(bridge._mcp_tool_name("a.b"))
+    names = [bridge._mcp_tool_name(i) for i in ids]
+    assert len(set(names)) == len(ids)
+    assert "toolgate_request_status" not in names
+    assert all(len(name) <= 64 for name in names)
+
+
+@pytest.mark.parametrize("status", [302, 503])
+def test_transport_never_follows_redirects_or_retries(status, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    received = []
+
+    class Upstream(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append(self.path)
+            self.send_response(status if self.path == "/v2/agent/status" else 200)
+            if status == 302:
+                self.send_header("Location", "/credential-sink")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("TOOLGATE_URL", f"http://127.0.0.1:{upstream.server_port}")
+    monkeypatch.setenv("TOOLGATE_EXECUTION_KEY", "scoped-test-key")
+    try:
+        with pytest.raises(RuntimeError):
+            bridge._request("GET", "/v2/agent/status")
+        assert received == ["/v2/agent/status"]
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=5)

@@ -53,6 +53,7 @@ _CONFIG_KEYS = _CONTROL_KEYS | {
     "TOOLGATE_DASHBOARD_ORIGINS",
     "TOOLGATE_DATA_DIR",
     "TOOLGATE_ENV_PATH",
+    # Retired configuration stays reserved so upgrades cannot expose it as provider secrets.
     "TOOLGATE_MCP_ACTOR",
     "TOOLGATE_MCP_PRESERVE_IDS",
     "TOOLGATE_MEMORYGATE_AGENT_ID",

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation } from 'wouter';
-import { Activity, Bot, Boxes, Gauge, KeyRound, LockKeyhole, MoreHorizontal, Settings, ShieldCheck, Wrench, Workflow } from 'lucide-react';
+import { Activity, Boxes, Gauge, KeyRound, LockKeyhole, MoreHorizontal, Settings, ShieldCheck, Wrench, Workflow } from 'lucide-react';
 import Logo from './Logo';
 import { api } from '../lib/api';
 
@@ -8,7 +8,6 @@ const NAV_GROUPS = [
   { label: 'Operate', items: [
     { to: '/command-center', label: 'Command Center', icon: Gauge },
     { to: '/activity', label: 'Live Activity', icon: Activity },
-    { to: '/ai-builder', label: 'ToolGate AI', icon: Bot },
   ] },
   { label: 'Capabilities', items: [
     { to: '/automations', label: 'Automations', icon: Workflow },

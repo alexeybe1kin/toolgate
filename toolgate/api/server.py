@@ -1,7 +1,7 @@
 """ToolGate v2 API: a typed, owner-controlled agent capability boundary."""
-import ipaddress
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -18,7 +18,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from toolgate.core import control_plane, planner, research, vault
+from toolgate.core import control_plane, legacy_archive, vault
+from toolgate.executors import research
 
 SERVICE_VERSION = "0.2.2"
 
@@ -51,6 +52,11 @@ def require_agent(x_toolgate_execution_key: str | None = Header(None, alias="X-T
 @app.on_event("startup")
 def startup():
     control_plane.purge_legacy_state()
+    try:
+        legacy_archive.migrate()
+    except (sqlite3.Error, ValueError) as exc:
+        raise RuntimeError("AI archive migration failed; keep ToolGate stopped, preserve toolgate.db, "
+                           "and inspect the migration error before retrying") from exc
     generated = vault.ensure_control_keys()
     for name in generated:
         print(f"[toolgate] generated and persisted {name}; value intentionally not logged")
@@ -245,18 +251,24 @@ def _run_dependency_checks() -> dict:
     checks = {"control_plane_db": _probe_control_plane(), "vault": vault.vault_status()}
     try:
         settings = control_plane.settings()
+        generation_configured = bool(settings.get("generation_url")) or any(
+            tool.get("status") == "active" and tool.get("execution", {}).get("type") == "ollama_generate"
+            for tool in control_plane.list_objects("tool")
+        )
     except (sqlite3.Error, OSError, ValueError):
         settings = {}
+        generation_configured = False
 
     probes = {"searxng": (settings.get("research_searxng_url", "http://toolgate-searxng:8080"), "/healthz")}
     if _memorygate_configured():
         probes["memorygate"] = (os.environ.get("MEMORYGATE_URL", "http://memorygate-api:8020"), "/health")
-        probes["planner"] = (settings.get("planner_url", "http://memorygate-ollama:11434"), "/api/tags")
     else:
-        # The planner and the MemoryGate executors both live in that stack; with
-        # no read credential neither is configured, so neither can be "down".
         checks["memorygate"] = {"status": "not_configured"}
-        checks["planner"] = {"status": "not_configured"}
+
+    if generation_configured:
+        probes["generation"] = (settings.get("generation_url", "http://memorygate-ollama:11434"), "/api/tags")
+    else:
+        checks["generation"] = {"status": "not_configured"}
 
     with ThreadPoolExecutor(max_workers=len(probes)) as pool:
         results = {name: pool.submit(_probe_http, url, path) for name, (url, path) in probes.items()}
@@ -407,32 +419,13 @@ class V2RequestDecision(BaseModel):
     note: str = ""
 
 
-class V2AiConversation(BaseModel):
-    target_kind: str
-    messages: list[dict]
-
-
-class V2AiProposal(BaseModel):
-    target_kind: str
-    draft: dict
-    conversation: list[dict]
-
-
-class V2AiSessionCreate(BaseModel):
-    target_kind: str
-
-
-class V2AiSessionMessage(BaseModel):
-    content: str
-
-
 class V2Invoke(BaseModel):
     args: dict = {}
     approval_request_id: str | None = None
 
 
 class V2Settings(BaseModel):
-    planner_model: str = "qwen3:4b"
+    generation_model: str = "qwen3:4b"
     event_retention_days: int = 90
     default_confirmation_expiry_seconds: int = 60
     producthunt_commercial_use_approved: bool = False
@@ -770,11 +763,11 @@ def _execute_memorygate(execution: dict, args: dict) -> dict:
 
 
 def _execute_ollama(execution: dict, args: dict) -> dict:
-    url = control_plane.settings().get("planner_url", "http://memorygate-ollama:11434").rstrip("/")
+    url = control_plane.settings().get("generation_url", "http://memorygate-ollama:11434").rstrip("/")
     prompt = _render_template(execution["prompt_template"], args)
     try:
         response = httpx.post(f"{url}/api/generate", json={
-            "model": execution.get("model") or control_plane.settings().get("planner_model", "qwen3:4b"),
+            "model": execution.get("model") or control_plane.settings().get("generation_model", "qwen3:4b"),
             "prompt": prompt, "stream": False, "think": False,
             "options": {"temperature": float(execution.get("temperature", 0.0)),
                         "num_predict": int(execution.get("max_tokens", 256)), "num_ctx": 4096},
@@ -1087,99 +1080,6 @@ def automation_definition_errors(automation: dict) -> list[str]:
     return errors
 
 
-def _planner_tool_catalog() -> list[dict]:
-    catalog = []
-    for tool in control_plane.list_objects("tool"):
-        if tool.get("status") != "active":
-            continue
-        catalog.append({
-            "id": tool["id"],
-            "description": str(tool.get("description", ""))[:300],
-            "inputs": tool.get("inputs", [])[:20],
-            "outputs": tool.get("outputs", [])[:20],
-            "authorization": tool.get("authorization", "owner_confirmation"),
-            "executor": tool.get("execution", {}).get("type"),
-        })
-    return catalog[:50]
-
-
-def _planner_memory_context(query: str) -> dict:
-    try:
-        access_key = vault.get_key("MEMORYGATE_READ_KEY")
-    except KeyError:
-        return {"available": False, "memories": [], "entities": []}
-    base_url = os.environ.get("MEMORYGATE_URL", "http://memorygate-api:8020").rstrip("/")
-    try:
-        response = httpx.post(
-            f"{base_url}/runtime/context",
-            json={"query": query[:2000], "max_items": 8, "include_evidence": False},
-            headers={"X-MemoryGate-Key": access_key, "X-Agent-Id": "default"},
-            timeout=20,
-        )
-        response.raise_for_status()
-        raw = response.json()
-    except (httpx.HTTPError, ValueError, TypeError):
-        return {"available": False, "memories": [], "entities": []}
-    memories = []
-    for item in raw.get("memories", []):
-        if not isinstance(item, dict) or item.get("confidence") != "high":
-            continue
-        memories.append({
-            "text": str(item.get("text") or item.get("summary") or "")[:600],
-            "type": str(item.get("type", "fact"))[:40],
-            "confidence": "high",
-            "source_type": str(item.get("source_type", ""))[:60],
-        })
-    entities = []
-    for item in raw.get("entities", [])[:8]:
-        if not isinstance(item, dict):
-            continue
-        entities.append({
-            "name": str(item.get("name", ""))[:120],
-            "type": str(item.get("type", ""))[:60],
-            "description": str(item.get("description") or item.get("summary") or "")[:500],
-        })
-    return {"available": True, "memories": memories[:8], "entities": entities}
-
-
-def _planner_inputs(target_kind: str, messages: list[dict]) -> tuple[dict, list[dict]]:
-    owner_messages = [str(item.get("content", "")) for item in messages if item.get("role") == "user"]
-    query = "\n".join(owner_messages[-3:])[:2000] if owner_messages else f"owner preferences for this {target_kind}"
-    return _planner_memory_context(query), _planner_tool_catalog()
-
-
-def _tighten_draft_limits_from_memory(draft: dict, memory_context: dict) -> dict:
-    if not isinstance(draft, dict) or not isinstance(memory_context, dict):
-        return draft
-    patterns = {
-        "max_per_hour": r"at most\s+(\d+)\s+runs?\s+per\s+hour",
-        "max_runtime_seconds": r"(\d+)\s+seconds?\s+runtime",
-        "max_steps": r"(\d+)\s+workflow\s+steps?",
-    }
-    ceilings = {}
-    for memory in memory_context.get("memories", []):
-        if not isinstance(memory, dict) or memory.get("source_type") not in {"owner", "owner_validation", "user"}:
-            continue
-        text = str(memory.get("text", "")).lower()
-        for name, pattern in patterns.items():
-            match = re.search(pattern, text)
-            if match:
-                value = int(match.group(1))
-                if value > 0:
-                    ceilings[name] = min(value, ceilings.get(name, value))
-    if not ceilings:
-        return draft
-    policy = {**(draft.get("policy") or {})}
-    limits = {**(policy.get("usage_limits") or {})}
-    for name, ceiling in ceilings.items():
-        current = limits.get(name)
-        limits[name] = min(current, ceiling) if isinstance(current, int) and current > 0 else ceiling
-    if "max_per_hour" in ceilings and isinstance(limits.get("max_per_minute"), int):
-        limits["max_per_minute"] = min(limits["max_per_minute"], limits["max_per_hour"])
-    policy["usage_limits"] = limits
-    return {**draft, "policy": policy}
-
-
 def require_valid_automation_definition(automation: dict):
     errors = automation_definition_errors(automation)
     if errors:
@@ -1348,7 +1248,7 @@ def set_lockdown(enabled: bool, reason: str = "", _tier: str = Depends(require_a
 
 @app.get("/v2/settings")
 def get_settings(_tier: str = Depends(require_admin)):
-    return {"planner_model": "qwen3:4b", "event_retention_days": 90,
+    return {"generation_model": "qwen3:4b", "event_retention_days": 90,
             "default_confirmation_expiry_seconds": 60,
             "producthunt_commercial_use_approved": False, **control_plane.settings()}
 
@@ -1430,264 +1330,9 @@ def verification_callback(payload: VerificationCallback,
     return {"status": record["status"], "request_id": record["id"]}
 
 
-@app.post("/v2/ai/conversation")
-def ai_conversation(payload: V2AiConversation, _tier: str = Depends(require_admin)):
-    if payload.target_kind not in {"tool", "automation"}:
-        raise HTTPException(400, "target_kind must be tool or automation")
-    if control_plane.settings().get("lockdown"):
-        deny("LOCKED_DOWN", "ToolGate is in lockdown mode", 423)
-    try:
-        memory_context, tool_catalog = _planner_inputs(payload.target_kind, payload.messages)
-        result = planner.chat(payload.target_kind, payload.messages,
-                              memory_context=memory_context, tool_catalog=tool_catalog)
-    except RuntimeError as exc:
-        control_plane.event("ai_planner_failed", "warning", "planner", payload.target_kind, "admin", {"error": str(exc)})
-        raise HTTPException(503, str(exc))
-    control_plane.event("ai_planner_message", "info", "planner", payload.target_kind, "admin", {
-        "target_kind": payload.target_kind, "ready": result["ready"], "reply": result["reply"]})
-    return result
-
-
-@app.post("/v2/ai/proposals")
-def ai_proposal(payload: V2AiProposal, _tier: str = Depends(require_admin)):
-    if payload.target_kind not in {"tool", "automation"} or not payload.draft.get("id"):
-        raise HTTPException(400, "proposal needs a target_kind and typed draft id")
-    request = control_plane.create_request("ai_draft", f"Create {payload.target_kind}: {payload.draft.get('name', payload.draft['id'])}",
-        "ToolGate AI produced this typed draft after an owner conversation.", "admin",
-        {"target_kind": payload.target_kind, "draft": payload.draft, "conversation": payload.conversation[-12:]}, "info")
-    control_plane.event("ai_proposal_created", "info", "request", request["id"], "admin", {"target_kind": payload.target_kind})
-    return request
-
-
-def _ai_activity(phase: str, detail: str, status: str = "completed") -> dict:
-    return {"phase": phase, "detail": detail, "status": status, "created_at": datetime.now(timezone.utc).isoformat()}
-
-
-def _prepare_ai_draft(target_kind: str, draft: dict) -> dict:
-    allowed_fields = (
-        {"id", "name", "description", "service_id", "category", "inputs", "outputs",
-         "execution", "policy", "authorization"}
-        if target_kind == "tool" else
-        {"id", "name", "description", "inputs", "workflow", "policy",
-         "authorization", "schedule"}
-    )
-    prepared = {key: value for key, value in draft.items() if key in allowed_fields}
-    prepared.update({"status": "draft", "version": 1})
-    policy = {**(prepared.get("policy") or {})}
-    limits = {**(policy.get("usage_limits") or {})}
-    limits.setdefault("max_per_minute", 10)
-    limits.setdefault("max_per_hour", 100)
-    limits.setdefault("cooldown_seconds", 1)
-    limits.setdefault("max_runtime_seconds", 30)
-    if target_kind == "automation":
-        limits.setdefault("max_steps", 20)
-        prepared.setdefault("workflow", [])
-        prepared.setdefault("inputs", [])
-    else:
-        prepared.setdefault("execution", {"type": "planned"})
-        prepared.setdefault("inputs", [])
-        prepared.setdefault("outputs", [])
-        prepared.setdefault("category", "controlled")
-    policy["usage_limits"] = limits
-    prepared["policy"] = policy
-    if prepared.get("authorization") not in {"auto", "ai_review", "owner_confirmation", "blocked"}:
-        prepared["authorization"] = "owner_confirmation"
-    if prepared.get("category") in {"sensitive", "dangerous"}:
-        prepared["authorization"] = "owner_confirmation"
-    return prepared
-
-
-@app.get("/v2/ai/sessions")
-def list_ai_sessions(_tier: str = Depends(require_admin)):
-    return control_plane.list_objects("ai_session")
-
-
-@app.post("/v2/ai/sessions")
-def create_ai_session(payload: V2AiSessionCreate, _tier: str = Depends(require_admin)):
-    if payload.target_kind not in {"tool", "automation"}:
-        raise HTTPException(400, "target_kind must be tool or automation")
-    if control_plane.settings().get("lockdown"):
-        deny("LOCKED_DOWN", "ToolGate is in lockdown mode", 423)
-    session = control_plane.create_ai_session(payload.target_kind)
-    control_plane.event("ai_session_created", "info", "ai_session", session["id"], "admin",
-                        {"target_kind": payload.target_kind})
-    return session
-
-
-@app.get("/v2/ai/sessions/{session_id}")
-def get_ai_session(session_id: str, _tier: str = Depends(require_admin)):
-    session = control_plane.get("ai_session", session_id)
-    if not session:
-        raise HTTPException(404, "AI session not found")
-    return session
-
-
-@app.delete("/v2/ai/sessions/{session_id}")
-def delete_ai_session(session_id: str, _tier: str = Depends(require_admin)):
-    if not control_plane.remove("ai_session", session_id):
-        raise HTTPException(404, "AI session not found")
-    control_plane.event("ai_session_deleted", "warning", "ai_session", session_id, "admin")
-    return {"deleted": True, "id": session_id}
-
-
-@app.post("/v2/ai/sessions/{session_id}/messages")
-def send_ai_session_message(session_id: str, payload: V2AiSessionMessage, _tier: str = Depends(require_admin)):
-    if control_plane.settings().get("lockdown"):
-        deny("LOCKED_DOWN", "ToolGate is in lockdown mode", 423)
-    session = control_plane.get("ai_session", session_id)
-    if not session:
-        raise HTTPException(404, "AI session not found")
-    content = payload.content.strip()
-    if not content:
-        raise HTTPException(400, "message cannot be empty")
-    now = datetime.now(timezone.utc).isoformat()
-    messages = [*session.get("messages", []), {"role": "user", "content": content[:8000], "created_at": now}]
-    normalized = re.sub(r"[^a-z0-9 ]+", "", content.lower()).strip()
-    if session.get("draft") and normalized in AI_CONFIRMATIONS:
-        messages.append({
-            "role": "assistant",
-            "content": "The current draft is confirmed without rebuilding it. Submit it for owner approval when you are ready.",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-        activity = [*session.get("activity", []),
-                    _ai_activity("Draft confirmed", "Owner confirmed the current typed draft; no planner rebuild was run.")]
-        updated = control_plane.update_ai_session(session_id, {
-            "messages": messages,
-            "activity": activity[-100:],
-            "status": "submitted" if session.get("proposal_request_id") else "draft_ready",
-        })
-        control_plane.event("ai_draft_confirmed", "info", "ai_session", session_id, "admin")
-        return updated
-    activity = [*session.get("activity", []), _ai_activity("Understanding request", "Reading the new owner message.", "running")]
-    title = session.get("title", "")
-    if title.startswith("New "):
-        title = content[:64].rstrip() + ("..." if len(content) > 64 else "")
-    session = control_plane.update_ai_session(session_id, {
-        "messages": messages, "activity": activity[-100:], "title": title, "status": "planning",
-    })
-    try:
-        planner_messages = [{"role": item["role"], "content": item["content"]} for item in messages]
-        memory_context, tool_catalog = _planner_inputs(session["target_kind"], planner_messages)
-        result = planner.chat(session["target_kind"], planner_messages,
-                              memory_context=memory_context, tool_catalog=tool_catalog)
-    except RuntimeError as exc:
-        activity[-1] = _ai_activity("Understanding request", "Planner could not complete this step.", "failed")
-        control_plane.update_ai_session(session_id, {"activity": activity[-100:], "status": "failed"})
-        control_plane.event("ai_planner_failed", "warning", "ai_session", session_id, "admin", {"error": str(exc)})
-        raise HTTPException(503, str(exc))
-    messages.append({"role": "assistant", "content": result["reply"], "created_at": datetime.now(timezone.utc).isoformat()})
-    activity[-1] = _ai_activity("Understanding request", "Interpreted the requested outcome and current constraints.")
-    if result["ready"]:
-        draft = _prepare_ai_draft(session["target_kind"], result["draft"])
-        draft = _tighten_draft_limits_from_memory(draft, memory_context)
-        definition_errors = (tool_definition_errors(draft) if session["target_kind"] == "tool"
-                             else automation_definition_errors(draft))
-        if definition_errors:
-            previous_draft = session.get("draft")
-            previous_errors = ((tool_definition_errors(previous_draft)
-                                if session["target_kind"] == "tool"
-                                else automation_definition_errors(previous_draft))
-                               if isinstance(previous_draft, dict) else definition_errors)
-            if previous_draft and not previous_errors:
-                draft = previous_draft
-                messages[-1]["content"] = (
-                    "I could not safely apply that revision, so I preserved the last valid draft. "
-                    f"The proposed change was incomplete: {'; '.join(definition_errors)}."
-                )
-                activity.append(_ai_activity("Draft validation", "Rejected an incomplete revision and preserved the valid draft.", "failed"))
-            else:
-                draft = None
-                messages[-1]["content"] = (
-                    "I could not produce an executable typed draft yet. "
-                    f"The draft was rejected because {'; '.join(definition_errors)}. Please clarify the intended execution."
-                )
-                activity.append(_ai_activity("Draft validation", "Rejected an incomplete or unsupported tool definition.", "failed"))
-                stages = [
-                    {"id": "requirements", "label": "Clarifying requirements", "status": "active"},
-                    {"id": "contract", "label": "Defining inputs and outputs", "status": "queued"},
-                    {"id": "execution", "label": "Creating executable layer", "status": "queued"},
-                    {"id": "safety", "label": "Creating safety policy", "status": "queued"},
-                    {"id": "limits", "label": "Applying deterministic limits", "status": "queued"},
-                    {"id": "review", "label": "Preparing owner review", "status": "queued"},
-                ]
-                updated = control_plane.update_ai_session(session_id, {
-                    "messages": messages, "activity": activity[-100:], "stages": stages,
-                    "status": "clarifying", "draft": None,
-                })
-                control_plane.event("ai_draft_rejected", "warning", "ai_session", session_id, "admin",
-                                    {"errors": definition_errors})
-                return updated
-        stages = [
-            {"id": "requirements", "label": "Clarifying requirements", "status": "completed"},
-            {"id": "contract", "label": "Defining inputs and outputs", "status": "completed"},
-            {"id": "execution", "label": "Creating executable layer", "status": "completed"},
-            {"id": "safety", "label": "Creating safety policy", "status": "completed"},
-            {"id": "limits", "label": "Applying deterministic limits", "status": "completed"},
-            {"id": "review", "label": "Preparing owner review", "status": "active"},
-        ]
-        activity.extend([
-            _ai_activity("Input contract", f"Defined {len(draft.get('inputs', []))} typed input fields."),
-            _ai_activity("Executable layer", "Drafted the restricted executor." if session["target_kind"] == "tool" else f"Drafted {len(draft.get('workflow', []))} workflow blocks."),
-            _ai_activity("Safety policy", f"Selected {draft.get('authorization', 'owner_confirmation').replace('_', ' ')} authorization."),
-            _ai_activity("Deterministic limits", "Applied bounded rate, cooldown, runtime, and step defaults."),
-            _ai_activity("Owner review", "Draft is ready to submit as an owner request.", "waiting"),
-        ])
-        status = "draft_ready"
-    else:
-        draft = session.get("draft")
-        stages = [
-            {"id": "requirements", "label": "Clarifying requirements", "status": "active"},
-            {"id": "contract", "label": "Defining inputs and outputs", "status": "queued"},
-            {"id": "execution", "label": "Creating executable layer", "status": "queued"},
-            {"id": "safety", "label": "Creating safety policy", "status": "queued"},
-            {"id": "limits", "label": "Applying deterministic limits", "status": "queued"},
-            {"id": "review", "label": "Preparing owner review", "status": "queued"},
-        ]
-        activity.append(_ai_activity("Clarifying requirements", "Waiting for the owner's answer.", "waiting"))
-        status = "clarifying"
-    updated = control_plane.update_ai_session(session_id, {
-        "messages": messages, "activity": activity[-100:], "stages": stages,
-        "status": status, "draft": draft,
-    })
-    control_plane.event("ai_planner_message", "info", "ai_session", session_id, "admin",
-                        {"target_kind": session["target_kind"], "ready": result["ready"]})
-    return updated
-
-
-@app.post("/v2/ai/sessions/{session_id}/submit")
-def submit_ai_session(session_id: str, _tier: str = Depends(require_admin)):
-    session = control_plane.get("ai_session", session_id)
-    if not session:
-        raise HTTPException(404, "AI session not found")
-    if not session.get("draft"):
-        raise HTTPException(409, "This session has no completed draft")
-    if session.get("proposal_request_id"):
-        raise HTTPException(409, "This draft has already been submitted")
-    planner_messages = [{"role": item["role"], "content": item["content"]}
-                        for item in session.get("messages", []) if item.get("role") in {"user", "assistant"}]
-    memory_context, _tool_catalog = _planner_inputs(session["target_kind"], planner_messages)
-    draft = _tighten_draft_limits_from_memory(_prepare_ai_draft(session["target_kind"], session["draft"]),
-                                               memory_context)
-    if session["target_kind"] == "tool":
-        require_valid_tool_definition(draft)
-    else:
-        require_valid_automation_definition(draft)
-    if draft != session["draft"]:
-        session = control_plane.update_ai_session(session_id, {"draft": draft})
-    request = control_plane.create_request(
-        "ai_draft", f"Create {session['target_kind']}: {draft.get('name', draft['id'])}",
-        "ToolGate AI produced this typed draft after a persistent owner conversation.", "admin",
-        {"target_kind": session["target_kind"], "draft": draft,
-         "conversation": session.get("messages", [])[-12:], "ai_session_id": session_id}, "info",
-    )
-    activity = [*session.get("activity", []), _ai_activity("Owner review", "Proposal submitted to Requests.", "completed")]
-    updated = control_plane.update_ai_session(session_id, {
-        "proposal_request_id": request["id"], "status": "submitted", "activity": activity[-100:],
-        "stages": [{**stage, "status": "completed"} for stage in session.get("stages", [])],
-    })
-    control_plane.event("ai_proposal_created", "info", "ai_session", session_id, "admin",
-                        {"target_kind": session["target_kind"], "request_id": request["id"]})
-    return {"session": updated, "request": request}
+@app.get("/v2/archives/ai")
+def export_ai_archive(_tier: str = Depends(require_admin)):
+    return legacy_archive.export()
 
 
 @app.get("/v2/agent-keys")
@@ -1942,6 +1587,8 @@ def list_requests(_tier: str = Depends(require_admin)):
 def create_agent_request(payload: V2Request, agent: dict = Depends(require_agent)):
     if control_plane.settings().get("lockdown"):
         deny("LOCKED_DOWN", "ToolGate is in lockdown mode", 423)
+    if payload.kind == "ai_draft":
+        deny("AI_DRAFT_RETIRED", "AI drafts belong in Pi", 410, "Use the owner tools API to register a reviewed capability")
     return control_plane.create_request(payload.kind, payload.title, payload.details, agent["name"],
                                         {**payload.payload, "created_by_agent_key": agent["id"]}, payload.severity)
 
@@ -1958,6 +1605,8 @@ def agent_request_status(request_id: str, agent: dict = Depends(require_agent)):
 
 @app.post("/v2/admin/requests")
 def create_admin_request(payload: V2Request, _tier: str = Depends(require_admin)):
+    if payload.kind == "ai_draft":
+        deny("AI_DRAFT_RETIRED", "AI drafts belong in Pi", 410, "Use the owner tools API to register a reviewed capability")
     return control_plane.create_request(payload.kind, payload.title, payload.details, "admin", payload.payload, payload.severity)
 
 
@@ -1965,31 +1614,16 @@ def create_admin_request(payload: V2Request, _tier: str = Depends(require_admin)
 def decide_request(request_id: str, payload: V2RequestDecision, _tier: str = Depends(require_admin)):
     if payload.status not in {"approved", "rejected", "dismissed"}:
         raise HTTPException(400, "status must be approved, rejected, or dismissed")
+    existing = control_plane.get("request", request_id)
+    if existing and existing.get("kind") == "ai_draft":
+        deny("AI_DRAFT_RETIRED", "Legacy AI drafts are read-only history", 410,
+             "Export /v2/archives/ai and recreate the capability through the owner tools API")
     try:
         record = control_plane.decide_request(request_id, payload.status, "admin", payload.note)
     except ValueError as exc:
         raise HTTPException(409, str(exc))
     if not record:
         raise HTTPException(404, "request not found")
-    if record["kind"] == "ai_draft" and payload.status == "approved":
-        proposal = record.get("payload", {})
-        target_kind, draft = proposal.get("target_kind"), proposal.get("draft", {})
-        try:
-            # Approval accepts the planner's proposal into the owner workspace.
-            # A separate owner edit is required before the capability becomes active.
-            draft["status"] = "draft"
-            if target_kind == "tool":
-                require_valid_tool_definition(draft)
-                created = control_plane.create_tool(draft)
-            elif target_kind == "automation":
-                require_valid_automation_definition(draft)
-                created = control_plane.create_automation(draft)
-            else:
-                raise ValueError("AI proposal has no valid target kind")
-        except (KeyError, ValueError) as exc:
-            raise HTTPException(409, f"Could not promote approved AI proposal: {exc}")
-        control_plane.event("ai_proposal_promoted", "info", target_kind, created["id"], "admin", {"request_id": request_id})
-        record["created"] = created
     return record
 
 

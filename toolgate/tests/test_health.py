@@ -65,7 +65,7 @@ class HealthTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def point_upstreams_at(self, url: str):
-        control_plane.update_settings({"research_searxng_url": url, "planner_url": url}, "test")
+        control_plane.update_settings({"research_searxng_url": url, "generation_url": url}, "test")
 
     def configure_memorygate(self):
         vault.set_secret("MEMORYGATE_READ_KEY", "mg_read_test_value")
@@ -90,7 +90,7 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(body["version"], server.SERVICE_VERSION)
         self.assertEqual({name: check["status"] for name, check in body["checks"].items()}, {
             "control_plane_db": "ok", "vault": "ok",
-            "searxng": "ok", "memorygate": "ok", "planner": "ok",
+            "searxng": "ok", "memorygate": "ok", "generation": "ok",
         })
 
     def test_health_names_the_dependency_that_stopped_answering(self):
@@ -104,7 +104,7 @@ class HealthTests(unittest.TestCase):
         body = self.health()
 
         self.assertEqual(body["status"], "degraded")
-        self.assertEqual(body["degraded"], ["memorygate", "planner", "searxng"])
+        self.assertEqual(body["degraded"], ["generation", "memorygate", "searxng"])
         self.assertEqual(body["checks"]["searxng"]["status"], "unavailable")
         self.assertEqual(body["checks"]["control_plane_db"]["status"], "ok")
 
@@ -134,13 +134,13 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(body["checks"]["vault"]["status"], "unavailable")
 
     def test_an_unconfigured_dependency_is_not_reported_as_broken(self):
-        self.point_upstreams_at(self.upstream_url)
+        control_plane.update_settings({"research_searxng_url": self.upstream_url}, "test")
 
         body = self.health()
 
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["checks"]["memorygate"]["status"], "not_configured")
-        self.assertEqual(body["checks"]["planner"]["status"], "not_configured")
+        self.assertEqual(body["checks"]["generation"]["status"], "not_configured")
 
     def test_health_answers_from_cache_and_says_how_old_the_answer_is(self):
         self.point_upstreams_at(self.upstream_url)

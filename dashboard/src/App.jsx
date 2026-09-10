@@ -6,7 +6,6 @@ import AuthScreen from './screens/AuthScreen';
 import Layout from './components/Layout';
 import SecretsScreen from './screens/SecretsScreen';
 import CapabilityDetailScreen from './screens/CapabilityDetailScreen';
-import AiBuilderScreen from './screens/AiBuilderScreen';
 import { ActivityScreen, AutomationsScreen, CommandCenterScreen, RequestsScreen, SecurityScreen, ServicesScreen, SettingsScreen, ToolsScreen, VerificationScreen } from './screens/ControlPlaneScreens';
 
 function Gate() {
@@ -23,7 +22,6 @@ function Gate() {
         <Route path="/"><Redirect to="/command-center" replace /></Route>
         <Route path="/command-center" component={CommandCenterScreen} />
         <Route path="/activity" component={ActivityScreen} />
-        <Route path="/ai-builder" component={AiBuilderScreen} />
         <Route path="/services" component={ServicesScreen} />
         <Route path="/tools/:id">{() => <CapabilityDetailScreen kind="tool" />}</Route>
         <Route path="/tools" component={ToolsScreen} />

@@ -4,8 +4,8 @@
       "command": "python",
       "args": ["toolgate/mcp/toolgate_mcp.py"],
       "env": {
-        "TOOLGATE_MCP_ACTOR": "Operator console",
-        "TOOLGATE_MCP_PRESERVE_IDS": "0"
+        "TOOLGATE_URL": "http://127.0.0.1:8010",
+        "TOOLGATE_EXECUTION_KEY": "replace-with-a-scoped-agent-key"
       }
     }
   }

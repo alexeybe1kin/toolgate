@@ -13,25 +13,24 @@ The project is designed for one owner and one primary local agent. ToolGate is t
 | **Automation** | A versioned deterministic workflow composed from tools and bounded control blocks. |
 | **Request** | Owner-reviewable verification, warning, proposal, update, or historical decision. |
 
-The dashboard includes a command center, live execution and AI activity, services, tool and automation editors, persistent ToolGate AI design sessions, requests, verification adapters, security controls, secrets, and settings.
+The dashboard includes a command center, live execution activity, services, tool and automation editors, requests, verification adapters, security controls, secrets, and settings.
 
 ## What Is In This Repository
 
-- `toolgate/api/`: FastAPI owner and agent API, restricted executors, automation runtime, verification callbacks, built-in research tool sync, and ToolGate AI planning endpoints.
-- `toolgate/core/`: SQLite control-plane storage, policy helpers, vault integration, planner helpers, research adapters, and runtime paths.
+- `toolgate/api/`: FastAPI owner and agent API, restricted executors, automation runtime, verification callbacks, built-in research tool sync.
+- `toolgate/executors/`: bounded search and fetch adapters.
+- `toolgate/core/`: SQLite control-plane storage, policy helpers, vault integration, legacy AI archival, and runtime paths.
 - `toolgate/cli/`: standard-library agent CLI for scoped execution keys.
-- `toolgate/mcp/`: single-operator stdio MCP console bridge. It has no execution key and no scope check; it is for the owner's own machine, never for an agent.
-- `dashboard/`: React and Vite owner dashboard for services, tools, automations, requests, secrets, security controls, and ToolGate AI sessions.
-- `integrations/mcp/`: example MCP client configuration for the single-operator console bridge.
+- `toolgate/mcp/`: opt-in authenticated stdio transport over the scoped HTTP execution API.
+- `dashboard/`: React and Vite owner dashboard for services, tools, automations, requests, secrets, security controls.
+- `integrations/mcp/`: scoped MCP client example, never enabled by Compose.
 - `docs/`: integration notes and dashboard screenshots.
 - `toolgate/tests/`: deterministic tests for the control plane, security model, workflow engine, research adapters, and MCP adapter.
 - `toolgate/scripts/`: live verification utilities for a running local stack.
 
 ## Dashboard Screenshots
 
-| Command Center | ToolGate AI |
-| --- | --- |
-| ![ToolGate Command Center](docs/screenshots/dashboard-command-center.png) | ![ToolGate AI builder](docs/screenshots/dashboard-ai-builder.png) |
+![ToolGate Command Center](docs/screenshots/dashboard-command-center.png)
 
 | Security Center | Secrets |
 | --- | --- |
@@ -48,11 +47,11 @@ The dashboard includes a command center, live execution and AI activity, service
 - Sensitive actions bind approval to the exact object type, object ID, version, argument digest, nonce, and expiry.
 - An approval is atomically consumed once. Replays and changed arguments fail closed.
 - Signed verification callbacks use HMAC-SHA256, a 60-second timestamp window, a per-request nonce, and immutable action binding.
-- Lockdown blocks agent execution, new agent requests, planner work, verification callbacks, and ToolGate-mediated MemoryGate access.
+- Lockdown blocks agent execution, new agent requests, verification callbacks, and ToolGate-mediated MemoryGate access.
 - Logs and API responses contain references and redacted outcomes, never injected secret values.
 - Browser access is restricted to configured local dashboard origins.
 
-The stdio MCP bridge is the one deliberate exception to the identity and scope rules above: it authenticates nobody and scopes nothing. It exists for a single trusted operator on the owner's own machine. Never attach an autonomous agent to it -- see [`docs/SINGLE_OPERATOR_MCP_BRIDGE.md`](docs/SINGLE_OPERATOR_MCP_BRIDGE.md).
+The MCP bridge has the same identity, scope, approval, lockdown and limit enforcement as the HTTP API. It has no local database or vault access.
 
 ToolGate reduces agent and prompt-injection risk, but it cannot protect a host that is already fully compromised. Keep the API private, protect the admin key, and use OS/container isolation as the outer security boundary.
 
@@ -132,47 +131,32 @@ toolgate watch
 
 Add `--json` to any command for a stable machine-readable contract. Values such as integers, arrays, objects, booleans, and `null` are coerced from JSON. Confirmation responses include a `request_id` and exact retry command using `--approval-request-id`.
 
-## Single-Operator MCP Console Bridge
+## Authenticated MCP bridge
 
-ToolGate ships a stdio MCP bridge at `toolgate/mcp/toolgate_mcp.py`. It is a
-convenience for **one trusted human on the machine that holds ToolGate's state**,
-so that the owner can drive their own ToolGate from an MCP client without
-minting a key.
+MCP is opt-in; normal Compose installs start no bridge. Configure a separate scoped
+execution key and explicitly run `python toolgate/mcp/toolgate_mcp.py`. Missing,
+invalid, revoked and admin keys fail closed. There is no operator bypass.
 
-**It bypasses identity and scope.** It reads no execution key, never calls
-`is_scoped`, exposes every tool with `status: active`, and attributes every call
-to one hardcoded actor. **Never attach an autonomous agent to it.** Agents use
-the keyed HTTP API with a scoped execution key, which authenticates the caller,
-filters the catalogue by scope and binds each approval to the key that asked for
-it.
+See [MCP setup](docs/AUTHENTICATED_MCP.md) and
+`integrations/mcp/toolgate.scoped.mcp.json`. Tool inputs use
+`{"args": {"query": "..."}, "approval_request_id": "optional-exact-request"}`.
+Discovery, calls and request status all use the authenticated agent HTTP routes.
 
-Everything below the identity layer still applies over the bridge: lockdown,
-input validation, `authorization: blocked`, the approval binding, usage limits,
-the restricted executors, output validation and audit events. It is a hole in
-*who is asking*, not in policy.
+## Retiring the AI workspace
 
-Example config:
+Pi owns conversations, planning, proposals and context assembly. `/v2/ai/*` and
+the AI Builder are removed, along with the planner and MCP skill injection.
+Startup atomically archives retained sessions, AI proposals and related events
+with their original IDs, raw JSON, timestamps and references. AI proposals leave
+the live queue and can no longer register capabilities by approval.
 
-```json
-{
-  "mcpServers": {
-    "toolgate": {
-      "command": "python",
-      "args": ["toolgate/mcp/toolgate_mcp.py"],
-      "env": {
-        "TOOLGATE_MCP_ACTOR": "Operator console",
-        "TOOLGATE_MCP_PRESERVE_IDS": "0"
-      }
-    }
-  }
-}
-```
+The owner can export the archive at `GET /v2/archives/ai`. This is a lossless
+handoff format, **not a completed import into Pi**. See
+[the migration contract](docs/AI_RETIREMENT.md) before upgrading or importing.
 
-Set `TOOLGATE_MCP_PRESERVE_IDS=1` only if the MCP client accepts dotted tool
-names such as `research.search`. Read
-[`docs/SINGLE_OPERATOR_MCP_BRIDGE.md`](docs/SINGLE_OPERATOR_MCP_BRIDGE.md)
-before using it; the example config is at
-`integrations/mcp/toolgate.single-operator.mcp.json`.
+Search, handle-bound fetch, deterministic workflows and atomic model calls remain
+execution capabilities. None owns a conversation, chooses a goal, or dispatches
+model-selected actions. The research adapters now live in `toolgate/executors/`.
 
 ## Local Deployment
 
@@ -214,19 +198,19 @@ An install that predates encryption is migrated on its next start: cleartext val
 
 ### Health
 
-`GET /health` is unauthenticated and runs real probes: the control-plane database, the vault, SearXNG, and -- when a MemoryGate credential is configured -- MemoryGate and the planner.
+`GET /health` is unauthenticated and runs real probes: the control-plane database, the vault, SearXNG, and -- when a MemoryGate credential is configured -- MemoryGate. Configured generation or an active Ollama tool also probes Ollama.
 
 ```json
 {
   "status": "degraded",
   "version": "v2",
-  "degraded": ["planner"],
+  "degraded": ["generation"],
   "checks": {
     "control_plane_db": {"status": "ok"},
     "vault": {"status": "ok", "key_source": "key_file"},
     "searxng": {"status": "ok"},
     "memorygate": {"status": "ok"},
-    "planner": {"status": "unreachable", "reason": "ConnectError"}
+    "generation": {"status": "unreachable", "reason": "ConnectError"}
   },
   "checked_at": "2026-09-05T11:08:05.185008+00:00",
   "age_seconds": 0.0
@@ -239,7 +223,6 @@ An install that predates encryption is migrated on its next start: cleartext val
 
 MemoryGate is registered as an internal service on the shared `conker_net` Docker network. ToolGate stores a dedicated MemoryGate read credential under `MEMORYGATE_READ_KEY` and exposes only approved read tools. The agent never receives direct MemoryGate credentials.
 
-ToolGate AI retrieves a bounded set of high-confidence memories and a redacted catalog of active tools while drafting. Raw evidence is excluded, all retrieved text is marked as untrusted reference data, generated tool references are checked against the live catalog, and trusted owner limits may only tighten a generated policy. Every AI proposal is revalidated again when it is submitted and approved.
 
 The default internal endpoints are:
 
@@ -260,10 +243,16 @@ Send the digest as `X-ToolGate-Signature: sha256=<hex>` and the Unix timestamp a
 
 ## Verification
 
-Run the deterministic unit suite:
+Install the pinned API requirements and pytest, then run the behavioral suite:
 
 ```powershell
-python -m unittest discover -s toolgate\tests -t . -v
+python -m pytest toolgate/tests --ignore=toolgate/tests/test_module_contract.py -q
+```
+
+Prove the A2/B5 tests detect broken behavior in disposable source copies:
+
+```powershell
+python toolgate/scripts/mutation_check.py
 ```
 
 Run one file:
@@ -288,13 +277,14 @@ The live verifier creates temporary namespaced capabilities and keys, tests exec
 ```text
 dashboard/                 React and Vite owner dashboard
 dashboard/server.py        Local dashboard static server
-docs/SINGLE_OPERATOR_MCP_BRIDGE.md
+docs/AUTHENTICATED_MCP.md
 docs/screenshots/          Dashboard screenshots used by this README
 integrations/mcp/          Example MCP client configuration
 toolgate/api/              FastAPI control-plane, agent API, and execution runtime
 toolgate/cli/              Agent-facing CLI
-toolgate/core/             Vault, policy, persistence, research, and planner modules
-toolgate/mcp/              Single-operator MCP console bridge (no key, no scope)
+toolgate/core/             Vault, policy, persistence, and legacy archive modules
+toolgate/executors/        Typed research search and fetch adapters
+toolgate/mcp/              Authenticated opt-in MCP transport
 toolgate/scripts/          Operational verification utilities
 toolgate/searxng/          Local SearXNG configuration used by research fallback
 toolgate/tests/            Deterministic security, workflow, research, and MCP tests

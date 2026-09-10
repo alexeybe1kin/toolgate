@@ -1,110 +1,102 @@
 #!/usr/bin/env python3
-"""Single-operator console bridge: stdio MCP over ToolGate's in-process internals.
+"""Opt-in stdio transport for the authenticated ToolGate HTTP execution API.
 
-THIS BRIDGE HAS NO IDENTITY AND NO SCOPE. It is a convenience for one trusted
-human operating their own machine, and nothing else.
-
-What it does not do, stated plainly:
-
-* It reads no execution key. There is no caller to authenticate.
-* It never calls ``control_plane.is_scoped``. Every tool whose status is
-  ``active`` is listed and callable, whatever the owner scoped anyone to.
-* Every call is attributed to the single hardcoded actor ``local-mcp``, so the
-  audit trail cannot tell two callers apart and the approval binding's
-  originating-agent check is a no-op across everything that arrives here.
-* It imports the control plane in-process and needs local file access to
-  ``toolgate.db`` and ``.env``, so it cannot reach a remote ToolGate.
-
-The rest of the boundary does still apply: lockdown, input validation,
-``authorization: blocked``, the approval binding, usage limits, the restricted
-executors, output validation and audit events all run exactly as they do over
-HTTP. It is the identity and scope layer that is absent -- which is precisely
-the layer that makes an untrusted caller safe.
-
-**Never expose this bridge to an autonomous agent.** An agent attached here
-holds the entire active catalogue with no scope and no attributable identity.
-Agents use the keyed HTTP API with a scoped execution key
-(``X-ToolGate-Execution-Key``), which enforces both. See
-``docs/SINGLE_OPERATOR_MCP_BRIDGE.md``.
+No database, vault, admin credential, or in-process execution access belongs in
+this process. Each request is authenticated again by ToolGate, so revocation and
+scope changes take effect without restarting a client.
 """
+
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import re
 import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlsplit
 
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from toolgate.core import control_plane  # noqa: E402
-from toolgate.core import vault  # noqa: E402
-
+import httpx
 
 SERVER_NAME = "toolgate"
 SERVER_VERSION = "0.3.0"
-_BOOTSTRAPPED = False
-_SKILL_CACHE_SECONDS = 300
-_MAX_SKILL_TEXT_BYTES = 2048
-_SKILL_CACHE: dict[str, tuple[float, str]] = {}
 
 
-def _bootstrap() -> None:
-    global _BOOTSTRAPPED
-    if _BOOTSTRAPPED:
-        return
-    _server_module().ensure_builtin_research_capabilities()
-    _BOOTSTRAPPED = True
-
-
-def _server_module():
-    from toolgate.api import server  # local import keeps the adapter lightweight in test contexts
-    return server
-
-
-def _local_actor() -> dict:
-    return {"id": "local-mcp", "name": os.environ.get("TOOLGATE_MCP_ACTOR", "Operator console")}
-
-
-def _visible_tools() -> list[dict]:
-    """Every active tool, with no scope filter.
-
-    Deliberate: there is no execution key here and therefore no agent to scope
-    against. This is why the bridge is single-operator only -- see the module
-    docstring.
-    """
-    return [
-        tool
-        for tool in control_plane.list_objects("tool")
-        if tool.get("status") == "active"
-    ]
+def _request(method: str, path: str, body: dict | None = None) -> Any:
+    key = os.environ.get("TOOLGATE_EXECUTION_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "Set TOOLGATE_EXECUTION_KEY to a scoped agent key before starting MCP"
+        )
+    base = os.environ.get("TOOLGATE_URL", "http://127.0.0.1:8010").rstrip("/")
+    url = urlsplit(base)
+    if (
+        url.scheme not in {"http", "https"}
+        or not url.hostname
+        or url.username
+        or url.password
+        or url.query
+        or url.fragment
+        or url.path not in {"", "/"}
+        or (
+            url.scheme == "http"
+            and url.hostname not in {"localhost", "127.0.0.1", "::1"}
+        )
+    ):
+        raise RuntimeError("Set TOOLGATE_URL to an HTTPS origin, or HTTP on loopback")
+    try:
+        # Redirects and environment proxies must never receive the execution key.
+        with httpx.Client(
+            follow_redirects=False, trust_env=False, timeout=300
+        ) as client:
+            response = client.request(
+                method,
+                base + path,
+                json=body,
+                headers={"X-ToolGate-Execution-Key": key},
+            )
+        if response.is_redirect:
+            raise RuntimeError(
+                "ToolGate redirected the request; set TOOLGATE_URL to its direct origin"
+            )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        try:
+            detail = exc.response.json().get("detail")
+        except ValueError:
+            detail = None
+        raise RuntimeError(
+            json.dumps(
+                {
+                    "status": exc.response.status_code,
+                    "detail": detail,
+                    "next_action": "Check the scoped key and ToolGate request status before retrying",
+                }
+            )
+        ) from None
+    except (httpx.HTTPError, ValueError):
+        # A timeout can follow a completed action. This transport never retries.
+        raise RuntimeError(
+            "ToolGate response unavailable; outcome may be unknown. Check its execution records before retrying"
+        ) from None
 
 
 def _json_type(field_type: str) -> str:
-    return field_type if field_type in {"string", "integer", "number", "boolean", "array", "object"} else "string"
+    return (
+        field_type
+        if field_type in {"string", "integer", "number", "boolean", "array", "object"}
+        else "string"
+    )
 
 
-def _mcp_tool_name(tool_id: str, all_ids: list[str] | None = None) -> str:
+def _mcp_tool_name(tool_id: str) -> str:
     """Return a broad-client-compatible MCP name while preserving ToolGate IDs internally."""
-    if os.environ.get("TOOLGATE_MCP_PRESERVE_IDS") == "1":
-        return tool_id
     name = re.sub(r"[^A-Za-z0-9_-]", "_", tool_id).strip("_") or "toolgate_tool"
     if not re.match(r"^[A-Za-z_]", name):
         name = f"tool_{name}"
-    name = name[:64]
-    if all_ids:
-        collisions = [item for item in all_ids if re.sub(r"[^A-Za-z0-9_-]", "_", item).strip("_")[:64] == name]
-        if len(collisions) > 1:
-            suffix = hashlib.sha1(tool_id.encode("utf-8")).hexdigest()[:8]
-            name = f"{name[:55]}_{suffix}"
+    suffix = hashlib.sha256(tool_id.encode("utf-8")).hexdigest()[:12]
+    name = f"{name[:51]}_{suffix}"
     return name
 
 
@@ -155,208 +147,135 @@ def _tool_input_schema(tool: dict) -> dict:
         properties[name] = _schema_for_field(field)
         if field.get("required"):
             required.append(name)
-    properties["approval_request_id"] = {
-        "type": "string",
-        "description": "Optional ToolGate approval request id for retrying an owner-approved action.",
-    }
-    schema: dict[str, Any] = {"type": "object", "properties": properties, "additionalProperties": False}
+    args = {"type": "object", "properties": properties, "additionalProperties": False}
     if required:
-        schema["required"] = required
-    return schema
-
-
-def _skill_injection_enabled() -> bool:
-    return os.environ.get("TOOLGATE_SKILL_INJECTION") == "1"
-
-
-def _memorygate_setting(name: str, default: str | None = None) -> str | None:
-    value = os.environ.get(name)
-    if value:
-        return value
-    try:
-        return vault.get_key(name)
-    except KeyError:
-        return default
-
-
-def _truncate_bytes(value: str, limit: int) -> str:
-    raw = value.encode("utf-8")
-    if len(raw) <= limit:
-        return value
-    return raw[:limit].decode("utf-8", errors="ignore").rstrip() + "\n[truncated]"
-
-
-def _request_memorygate_skills(tool_id: str) -> list[dict]:
-    base_url = (_memorygate_setting("MEMORYGATE_URL", "http://memorygate-api:8020") or "").rstrip("/")
-    read_key = _memorygate_setting("MEMORYGATE_READ_KEY")
-    if not base_url or not read_key:
-        return []
-    agent_id = _memorygate_setting("TOOLGATE_MEMORYGATE_AGENT_ID", os.environ.get("X_AGENT_ID", "pi-agent")) or "pi-agent"
-    query = urllib.parse.urlencode({"tool": tool_id})
-    request = urllib.request.Request(
-        f"{base_url}/context/skills?{query}",
-        headers={
-            "Accept": "application/json",
-            "X-Agent-Id": agent_id,
-            "X-MemoryGate-Key": read_key,
-        },
-    )
-    with urllib.request.urlopen(request, timeout=2) as response:
-        body = json.loads(response.read().decode("utf-8"))
-    return list(body.get("results", []))
-
-
-def _linked_skill_text(tool_id: str) -> str:
-    if not _skill_injection_enabled():
-        return ""
-    now = time.time()
-    cached = _SKILL_CACHE.get(tool_id)
-    if cached and now - cached[0] < _SKILL_CACHE_SECONDS:
-        return cached[1]
-    try:
-        skills = _request_memorygate_skills(tool_id)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError):
-        skills = []
-    if not skills:
-        _SKILL_CACHE[tool_id] = (now, "")
-        return ""
-    blocks = []
-    for skill in skills:
-        title = str(skill.get("title") or "Untitled skill")
-        version = str(skill.get("version") or "1")
-        body = str(skill.get("body") or "").strip()
-        if body:
-            blocks.append(f"{title} (v{version})\n{body}")
-    text = "\n\nLinked MemoryGate skills:\n" + "\n\n".join(blocks) if blocks else ""
-    text = _truncate_bytes(text, _MAX_SKILL_TEXT_BYTES)
-    _SKILL_CACHE[tool_id] = (now, text)
-    return text
-
-
-def _tool_to_mcp(tool: dict, all_ids: list[str] | None = None) -> dict:
-    description = tool.get("description") or f"Invoke ToolGate tool '{tool.get('id', 'unknown')}'."
-    if tool.get("authorization") == "owner_confirmation":
-        description += " Owner approval may be required."
-    description += f" ToolGate id: {tool['id']}."
-    description += _linked_skill_text(str(tool["id"]))
+        args["required"] = required
     return {
-        "name": _mcp_tool_name(str(tool["id"]), all_ids),
-        "description": description,
+        "type": "object",
+        "properties": {
+            "args": args,
+            "approval_request_id": {
+                "type": "string",
+                "description": "Exact approved request to consume once.",
+            },
+        },
+        "required": ["args"],
+        "additionalProperties": False,
+    }
+
+
+def _visible_tools() -> list[dict]:
+    return _request("GET", "/v2/agent/tools")
+
+
+def _tool_to_mcp(tool: dict) -> dict:
+    return {
+        "name": _mcp_tool_name(tool["id"]),
+        "description": (tool.get("description") or "Invoke a typed ToolGate tool.")
+        + f" ToolGate id: {tool['id']}.",
         "inputSchema": _tool_input_schema(tool),
     }
 
 
 def list_tools() -> list[dict]:
-    _bootstrap()
-    visible = _visible_tools()
-    all_ids = [str(tool["id"]) for tool in visible]
-    tools = [_tool_to_mcp(tool, all_ids) for tool in visible]
-    tools.append({
-        "name": "toolgate_request_status",
-        "description": "Check the status of a ToolGate request or approval.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "request_id": {"type": "string", "description": "The ToolGate request id to inspect."},
+    return [_tool_to_mcp(tool) for tool in _visible_tools()] + [
+        {
+            "name": "toolgate_request_status",
+            "description": "Check a request belonging to this execution key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"request_id": {"type": "string"}},
+                "required": ["request_id"],
+                "additionalProperties": False,
             },
-            "required": ["request_id"],
-            "additionalProperties": False,
-        },
-    })
-    return tools
-
-
-def _resolve_tool(tool_name: str) -> dict | None:
-    direct = control_plane.get("tool", tool_name)
-    if direct and direct.get("status") == "active":
-        return direct
-    visible = _visible_tools()
-    all_ids = [str(tool["id"]) for tool in visible]
-    for tool in visible:
-        if _mcp_tool_name(str(tool["id"]), all_ids) == tool_name:
-            return tool
-    return None
-
-
-def _request_status(request_id: str) -> dict:
-    request = control_plane.get("request", request_id)
-    if not request:
-        raise RuntimeError("request not found")
-    return {
-        "id": request["id"],
-        "kind": request["kind"],
-        "status": request["status"],
-        "title": request["title"],
-        "created_at": request["created_at"],
-        "decision": request.get("decision"),
-    }
+        }
+    ]
 
 
 def _invoke(tool_name: str, arguments: dict) -> dict:
-    _bootstrap()
-    actor = _local_actor()
+    if not isinstance(arguments, dict):
+        raise TypeError("Tool arguments must be an object")
     if tool_name == "toolgate_request_status":
-        return _request_status(str(arguments["request_id"]))
-    tool = _resolve_tool(tool_name)
-    if not tool:
-        raise RuntimeError(f"Tool '{tool_name}' was not found")
-    args = dict(arguments)
-    approval_request_id = args.pop("approval_request_id", None)
-    try:
-        return _server_module().invoke_tool(tool, args, actor["name"], approval_request_id=approval_request_id, actor_id=actor["id"])
-    except Exception as exc:
-        detail = getattr(exc, "detail", None)
-        detail = detail if isinstance(detail, dict) else {"code": "REQUEST_FAILED", "message": str(detail or exc)}
-        raise RuntimeError(json.dumps(detail, ensure_ascii=True))
+        return _request(
+            "GET", "/v2/agent/requests/" + quote(str(arguments["request_id"]), safe="")
+        )
+    tool = next(
+        (item for item in _visible_tools() if _mcp_tool_name(item["id"]) == tool_name),
+        None,
+    )
+    if tool is None:
+        raise RuntimeError(
+            "Tool unavailable for this key; refresh tools/list or ask the owner for scope"
+        )
+    if set(arguments) - {"args", "approval_request_id"} or not isinstance(
+        arguments.get("args"), dict
+    ):
+        raise RuntimeError(
+            "Supply tool inputs inside args, with optional approval_request_id alongside"
+        )
+    return _request(
+        "POST", "/v2/tools/" + quote(tool["id"], safe="") + "/invoke", arguments
+    )
 
 
-def respond(message_id: Any, result: Any | None = None, error: Exception | str | None = None) -> None:
+def respond(message_id: Any, result: Any = None, error: str | None = None) -> None:
     body = {"jsonrpc": "2.0", "id": message_id}
     if error is None:
         body["result"] = result
     else:
-        body["error"] = {"code": -32000, "message": str(error)}
+        body["error"] = {"code": -32000, "message": error}
     print(json.dumps(body), flush=True)
 
 
 def _handle_request(request: dict) -> None:
+    if "id" not in request:
+        return
     method = request.get("method")
     params = request.get("params", {})
+    if not isinstance(params, dict):
+        raise TypeError("MCP params must be an object")
     if method == "initialize":
-        _bootstrap()
-        respond(request.get("id"), {
-            "protocolVersion": params.get("protocolVersion", "2025-06-18"),
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        })
-        return
-    if method == "tools/list":
-        respond(request.get("id"), {"tools": list_tools()})
-        return
-    if method == "tools/call":
-        name = params.get("name")
-        if not name:
-            raise RuntimeError("tool name is required")
-        value = _invoke(str(name), params.get("arguments", {}))
-        respond(request.get("id"), {"content": [{"type": "text", "text": json.dumps(value)}]})
-        return
-    if "id" in request:
-        respond(request.get("id"), {})
+        _request("GET", "/v2/agent/status")
+        respond(
+            request["id"],
+            {
+                "protocolVersion": params.get("protocolVersion", "2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            },
+        )
+    elif method == "tools/list":
+        respond(request["id"], {"tools": list_tools()})
+    elif method == "tools/call":
+        try:
+            value = _invoke(str(params["name"]), params.get("arguments", {}))
+            result = {"content": [{"type": "text", "text": json.dumps(value)}]}
+        except (RuntimeError, KeyError, TypeError) as exc:
+            result = {"isError": True, "content": [{"type": "text", "text": str(exc)}]}
+        respond(request["id"], result)
+    elif method == "ping":
+        respond(request["id"], {})
+    else:
+        respond(request["id"], error="Unsupported MCP method")
 
 
 def main() -> int:
-    # Said out loud on every start, because the one way this bridge becomes
-    # dangerous is somebody attaching an agent to it without reading the docs.
-    print("[toolgate-mcp] single-operator console bridge: no execution key, no scope check, "
-          "every active tool exposed. Do not attach an autonomous agent; use the keyed HTTP API.",
-          file=sys.stderr, flush=True)
+    try:
+        _request("GET", "/v2/agent/status")
+    except RuntimeError as exc:
+        print(f"[toolgate-mcp] {exc}", file=sys.stderr)
+        return 2
     for line in sys.stdin:
         request = None
         try:
             request = json.loads(line)
+            if not isinstance(request, dict):
+                raise TypeError("MCP request must be an object")
             _handle_request(request)
-        except Exception as exc:  # pragma: no cover - protocol boundary
-            respond(request.get("id") if isinstance(request, dict) else None, error=exc)
+        except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+            respond(
+                request.get("id") if isinstance(request, dict) else None, error=str(exc)
+            )
     return 0
 
 

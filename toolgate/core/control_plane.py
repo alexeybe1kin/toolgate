@@ -482,48 +482,14 @@ def update_automation(automation_id: str, body: dict) -> dict | None:
     return create_automation({**body, "id": automation_id, "version": int(body.get("version", 1)) + 1})
 
 
-def create_ai_session(target_kind: str) -> dict:
-    session_id = str(uuid.uuid4())
-    label = "tool" if target_kind == "tool" else "automation"
-    return _put("ai_session", session_id, {
-        "title": f"New {label} design",
-        "target_kind": target_kind,
-        "status": "clarifying",
-        "messages": [{
-            "role": "assistant",
-            "content": f"Tell me what the {label} should accomplish. I will clarify the inputs, execution path, and safety limits before creating a draft.",
-            "created_at": _now(),
-        }],
-        "draft": None,
-        "proposal_request_id": None,
-        "stages": [
-            {"id": "requirements", "label": "Clarifying requirements", "status": "active"},
-            {"id": "contract", "label": "Defining inputs and outputs", "status": "queued"},
-            {"id": "execution", "label": "Creating executable layer", "status": "queued"},
-            {"id": "safety", "label": "Creating safety policy", "status": "queued"},
-            {"id": "limits", "label": "Applying deterministic limits", "status": "queued"},
-            {"id": "review", "label": "Preparing owner review", "status": "queued"},
-        ],
-        "activity": [{
-            "phase": "Session created",
-            "detail": f"Started a persistent {label} design workspace.",
-            "status": "completed",
-            "created_at": _now(),
-        }],
-    })
 
 
-def update_ai_session(session_id: str, changes: dict) -> dict | None:
-    session = get("ai_session", session_id)
-    if not session:
-        return None
-    protected = {"id", "created_at", "updated_at"}
-    session.update({key: value for key, value in changes.items() if key not in protected})
-    return _put("ai_session", session_id, session)
 
 
 def create_request(kind: str, title: str, details: str, actor: str, payload: dict | None = None,
                    severity: str = "info") -> dict:
+    if kind == "ai_draft":
+        raise ValueError("AI drafts are retired; use Pi for planning and the owner tools API for registration")
     request_id = str(uuid.uuid4())
     record = _put("request", request_id, {"kind": kind, "title": title, "details": details,
         "actor": actor, "payload": payload or {}, "severity": severity, "status": "pending"})

@@ -5,6 +5,23 @@ things, and a dashboard reading one field for both is wrong about every module
 it does not special-case. A change to the shape of `/health` or any endpoint is
 a contract change and gets its own entry.
 
+## Unreleased
+
+- Remove `/v2/ai/*`, the AI Builder, planner, automatic AI-draft promotion and
+  MCP MemoryGate skill injection. Pi owns cognition.
+- Archive retained AI sessions/proposals and related events transactionally in
+  `v2_ai_archive`; preserve original rows and IDs. Owner-only `/v2/archives/ai`
+  exports a versioned handoff. Pi import is still required separately.
+- Move deterministic research adapters to `toolgate/executors/research.py`;
+  existing tool IDs and executor contracts continue to work.
+- Replace the unscoped in-process MCP console with an opt-in authenticated HTTP
+  bridge. No vault access, admin fallback, redirect following or automatic retry.
+  Tool calls now nest inputs under `args`; normalized names have stable suffixes.
+- Rename `planner_model`/`planner_url` settings to `generation_model`/
+  `generation_url`, preserving configured values on upgrade for atomic Ollama
+  tools. `/health` keeps its envelope; its optional `planner` check is replaced
+  by `generation`, independent of MemoryGate credentials.
+
 ## 0.2.2
 
 Secrets no longer ship inside the image.
