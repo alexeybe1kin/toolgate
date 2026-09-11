@@ -213,7 +213,7 @@ def _invoke(tool_name: str, arguments: dict) -> dict:
         arguments.get("args"), dict
     ):
         raise RuntimeError(
-            "Supply tool inputs inside args, with optional approval_request_id alongside"
+            "Supply tool inputs inside args, with optional action_id, job_id and approval_request_id alongside"
         )
     return _request(
         "POST", "/v2/tools/" + quote(tool["id"], safe="") + "/invoke", arguments

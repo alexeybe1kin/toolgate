@@ -797,6 +797,7 @@ def _execute_gemini(execution: dict, args: dict) -> dict:
             "maxOutputTokens": int(execution.get("max_tokens", 800)),
             "responseMimeType": "application/json",
             "thinkingConfig": {"thinkingBudget": 0},
+            "candidateCount": 1,
         },
     }
     try:
@@ -1571,7 +1572,7 @@ def list_actions(_tier: str = Depends(require_admin)):
     return {"results": journal.list_actions()}
 
 
-@app.get("/v2/agent/actions/{action_id}")
+@app.get("/v2/agent/actions/{action_id:path}")
 def agent_action(action_id: str, agent: dict = Depends(require_agent)):
     record = journal.get(action_id)
     if not record or record["actor_id"] != agent["id"]:

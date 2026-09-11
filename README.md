@@ -36,6 +36,13 @@ The dashboard includes a command center, live execution activity, services, tool
 | --- | --- |
 | ![ToolGate Security Center](docs/screenshots/dashboard-security-center.png) | ![ToolGate Secrets screen](docs/screenshots/dashboard-secrets.png) |
 
+## Execution durability and spending
+
+Outbound calls require a caller-persisted `action_id`. Paid routes stay disabled until
+the owner configures prices, both ceilings and an agent/root-bound job. Workflow
+children share that job. Interrupted dispatches are held as `outcome_unknown`; missing
+billing telemetry keeps its reservation. See [the API contract and limitations](docs/DURABLE_EXECUTION_AND_SPENDING.md).
+
 ## Security Model
 
 - Agents authenticate with rotatable execution keys and explicit `tool:*`, `tool:<id>`, `automation:*`, or `automation:<id>` scopes.

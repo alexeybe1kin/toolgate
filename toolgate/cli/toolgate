@@ -44,7 +44,8 @@ def _flags(args):
         key = args.pop(0)[2:].replace("-", "_")
         if not args:
             raise ValueError(f"--{key.replace('_', '-')} needs a value")
-        values[key] = _coerce(args.pop(0))
+        value = args.pop(0)
+        values[key] = value if key in {"action_id", "job_id", "approval_request_id"} else _coerce(value)
     return values, output_json
 
 
@@ -121,14 +122,15 @@ def _info(path, output_json):
 def usage():
     print("""Usage:
   toolgate status [--json]
+  toolgate action status <id> [--json]
   toolgate update [--json]
   toolgate watch [--json]
   toolgate tool list [--json]
   toolgate tool <name> info [--json]
-  toolgate tool <name> --argument value [--approval-request-id <id>] [--json]
+  toolgate tool <name> --argument value --action-id <stable-id> [--job-id <id>] [--approval-request-id <id>] [--json]
   toolgate automation list [--json]
   toolgate automation <name> info [--json]
-  toolgate automation <name> run --argument value [--approval-request-id <id>] [--json]
+  toolgate automation <name> run --argument value --action-id <stable-id> [--job-id <id>] [--approval-request-id <id>] [--json]
   toolgate request create-tool|create-automation|edit|delete|secret "description" [--json]
   toolgate request status <id> [--json]
 """)
@@ -143,6 +145,10 @@ def main():
         if command == "status":
             _, output_json = _flags(args)
             return _request("GET", "/v2/agent/status", output_json=output_json)
+        if command == "action" and len(args) >= 2 and args.pop(0) == "status":
+            action_id = args.pop(0)
+            _, output_json = _flags(args)
+            return _request("GET", f"/v2/agent/actions/{action_id}", output_json=output_json)
         if command in {"update", "watch"}:
             _, output_json = _flags(args)
             return _request("GET", "/v2/agent/events", output_json=output_json)
@@ -157,8 +163,10 @@ def main():
                 return _info(f"/v2/agent/tools/{name}", output_json)
             values, output_json = _flags(args)
             approval = values.pop("approval_request_id", None)
+            action_id = values.pop("action_id", None)
+            job_id = values.pop("job_id", None)
             return _request("POST", f"/v2/tools/{name}/invoke",
-                            {"args": values, "approval_request_id": approval}, output_json=output_json)
+                            {"args": values, "approval_request_id": approval, "action_id": action_id, "job_id": job_id}, output_json=output_json)
         if command == "automation":
             if not args: usage(); return 2
             name = args.pop(0)
@@ -172,8 +180,10 @@ def main():
                 print("Usage: toolgate automation <name> run --argument value", file=sys.stderr); return 2
             values, output_json = _flags(args)
             approval = values.pop("approval_request_id", None)
+            action_id = values.pop("action_id", None)
+            job_id = values.pop("job_id", None)
             return _request("POST", f"/v2/automations/{name}/run",
-                            {"args": values, "approval_request_id": approval}, output_json=output_json)
+                            {"args": values, "approval_request_id": approval, "action_id": action_id, "job_id": job_id}, output_json=output_json)
         if command == "request":
             if not args: usage(); return 2
             sub = args.pop(0)

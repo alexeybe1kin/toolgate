@@ -141,8 +141,7 @@ def reserve(conn, action_id: str, job_id: str | None, actor_id: str,
     job = conn.execute("SELECT * FROM v2_spend_jobs WHERE job_id=?", (job_id,)).fetchone()
     if not policy or not policy["enabled"] or price["valid_until"] <= time.time():
         raise BudgetDenied("Paid dispatch is disabled or its price expired before reservation")
-    if (not job or job["actor_id"] != actor_id
-            or (not parent_action_id and job["root_action_id"] != action_id)):
+    if not job or job["actor_id"] != actor_id:
         raise BudgetDenied("Use the owner's job for this exact agent and root action")
     root = action_id
     if parent_action_id:

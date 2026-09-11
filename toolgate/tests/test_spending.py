@@ -224,3 +224,39 @@ def test_provider_bound_violation_disables_further_paid_dispatch(paid, monkeypat
     invoke(paid, job)
     assert spending.status()["policy"]["enabled"] == 0
     assert spending.status()["accounted_and_reserved_microusd"] >= spending.MAX_INPUT_TOKENS
+
+
+@pytest.mark.parametrize("mode", ["disabled", "missing", "expired"])
+def test_quote_requires_enabled_policy_and_current_known_price(paid, mode):
+    setup_budget()
+    with control_plane._conn() as db:
+        if mode == "disabled":
+            db.execute("UPDATE v2_spend_policy SET enabled=0")
+        elif mode == "missing":
+            db.execute("DELETE FROM v2_spend_prices")
+        else:
+            db.execute("UPDATE v2_spend_prices SET valid_until=0")
+    with pytest.raises(spending.BudgetDenied):
+        spending.quote(spending.MODEL, 128)
+
+
+def test_reservations_and_job_identity_cannot_be_erased(paid, monkeypatch):
+    job = setup_budget()
+    provider(monkeypatch)
+    invoke(paid, job)
+    for sql in ["DELETE FROM v2_spend_reservations", "UPDATE v2_spend_reservations SET reserved=0",
+                "INSERT OR REPLACE INTO v2_spend_reservations SELECT * FROM v2_spend_reservations",
+                "DELETE FROM v2_spend_jobs", "UPDATE v2_spend_jobs SET cap=999999999",
+                "INSERT OR REPLACE INTO v2_spend_jobs SELECT * FROM v2_spend_jobs"]:
+        with control_plane._conn() as db:
+            with pytest.raises(sqlite3.IntegrityError):
+                db.execute(sql)
+
+
+def test_budget_policy_changes_do_not_reset_cumulative_usage(paid, monkeypatch):
+    job = setup_budget()
+    provider(monkeypatch, {"promptTokenCount": 42, "candidatesTokenCount": 8, "totalTokenCount": 50})
+    invoke(paid, job)
+    spending.configure(False, 100, 100)
+    spending.configure(True, 100, 100)
+    assert spending.status()["accounted_and_reserved_microusd"] == 58
