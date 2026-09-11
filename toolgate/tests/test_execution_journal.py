@@ -13,7 +13,7 @@ from toolgate.core import control_plane, execution_journal as journal
 def tool(tmp_path, monkeypatch):
     monkeypatch.setattr(control_plane, "DB_PATH", tmp_path / "gate.db")
     return {"id": "act", "name": "Action", "version": 1, "authorization": "auto",
-            "inputs": [], "outputs": [], "execution": {"type": "http_json"}}
+            "inputs": [], "outputs": [], "execution": {"type": "http_json", "billing": {"mode": "free"}}}
 
 
 def invoke(tool, **kwargs):
@@ -102,7 +102,7 @@ def test_receipt_write_failure_never_becomes_permission_to_retry(tool, monkeypat
     calls = []
     monkeypatch.setattr(server, "_dispatch_tool", lambda *a: calls.append(1) or {"ok": True, "result": {}})
     with monkeypatch.context() as patch:
-        patch.setattr(journal, "finish", lambda *a: (_ for _ in ()).throw(sqlite3.OperationalError()))
+        patch.setattr(journal, "finish", lambda *a, **kw: (_ for _ in ()).throw(sqlite3.OperationalError()))
         with pytest.raises(sqlite3.OperationalError):
             invoke(tool)
     assert invoke(tool)["code"] == "IN_PROGRESS"

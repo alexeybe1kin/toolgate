@@ -15,9 +15,9 @@ from urllib.parse import quote, urlsplit
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool, StrictInt
 
-from toolgate.core import control_plane, execution_journal as journal, legacy_archive, vault
+from toolgate.core import control_plane, execution_journal as journal, legacy_archive, spending, vault
 from toolgate.core.public_https import DestinationDenied, public_client, public_url, resolve_public
 from toolgate.executors import research
 
@@ -780,8 +780,8 @@ def _execute_ollama(execution: dict, args: dict) -> dict:
 
 def _execute_gemini(execution: dict, args: dict) -> dict:
     model = execution["model"]
-    if model not in GEMINI_MODELS:
-        deny("AI_MODEL_DENIED", "The configured hosted model is not allowlisted", 422)
+    if model != spending.MODEL:
+        deny("AI_MODEL_DENIED", "This model has no bounded spending adapter", 422)
     prompt = _render_template(execution["prompt_template"], args)
     if not isinstance(prompt, str) or not 1 <= len(prompt) <= 20000:
         deny("VALIDATION_ERROR", "Hosted AI prompt must contain 1-20,000 characters", 422)
@@ -796,6 +796,7 @@ def _execute_gemini(execution: dict, args: dict) -> dict:
             "temperature": float(execution.get("temperature", 0.0)),
             "maxOutputTokens": int(execution.get("max_tokens", 800)),
             "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
     try:
@@ -820,9 +821,10 @@ def _execute_gemini(execution: dict, args: dict) -> dict:
         "result": {
             "text": text,
             "usage": {
-                "prompt_tokens": int(usage.get("promptTokenCount") or 0),
-                "completion_tokens": int(usage.get("candidatesTokenCount") or 0),
-                "total_tokens": int(usage.get("totalTokenCount") or 0),
+                "prompt_tokens": usage.get("promptTokenCount"),
+                "completion_tokens": usage.get("candidatesTokenCount"),
+                "total_tokens": usage.get("totalTokenCount"),
+                "thought_tokens": usage.get("thoughtsTokenCount", 0),
             },
             "model": model,
         },
@@ -951,6 +953,11 @@ def invoke_tool(tool: dict, args: dict, actor: str, *, approval_request_id: str 
             deny("ACTION_ID_REQUIRED", "Supply a stable action_id before dispatch; reuse it when checking or retrying", 422)
         action_id = "local_" + uuid.uuid4().hex
 
+    try:
+        price = _spending_preflight(tool, args)
+    except spending.BudgetDenied as exc:
+        deny("BUDGET_DENIED", str(exc), 403)
+
     def authorize(conn):
         if authorization in {"owner_confirmation", "ai_review"} and not approval_granted:
             approved, reason = control_plane.consume_verification_in_transaction(
@@ -960,7 +967,12 @@ def invoke_tool(tool: dict, args: dict, actor: str, *, approval_request_id: str 
     try:
         record, dispatch = journal.begin(action_id, "tool", tool["id"], args, identity,
                                          tool.get("version"), job_id=job_id,
-                                         parent_action_id=parent_action_id, authorize=authorize)
+                                         parent_action_id=parent_action_id, authorize=authorize,
+                                         reserve=(lambda conn: spending.reserve(
+                                             conn, action_id, job_id, identity, parent_action_id, price))
+                                         if price else None)
+    except spending.BudgetDenied as exc:
+        deny("BUDGET_DENIED", str(exc), 403)
     except (journal.ExecutionConflict, ValueError) as exc:
         deny("ACTION_CONFLICT", str(exc), 409)
     if not dispatch:
@@ -972,9 +984,26 @@ def invoke_tool(tool: dict, args: dict, actor: str, *, approval_request_id: str 
         return journal.response(journal.get(action_id))
     envelope = {"code": "OK" if result["ok"] else "TOOL_UNAVAILABLE",
                 "message": "Tool completed" if result["ok"] else result["error"], "result": result}
-    record = journal.finish(action_id, envelope)
+    usage = result.get("result", {}).get("usage") if isinstance(result.get("result"), dict) else None
+    record = journal.finish(action_id, envelope, reconcile=(
+        lambda conn: spending.reconcile(conn, action_id, usage)) if price else None)
     control_plane.event("tool_executed", "info" if result["ok"] else "warning", "tool", tool["id"], actor, {"ok": result["ok"], "action_id": action_id})
     return journal.response(record)
+
+
+def _spending_preflight(tool: dict, args: dict) -> dict | None:
+    execution = tool.get("execution", {})
+    kind = execution.get("type")
+    if kind == "gemini_generate":
+        prompt = _render_template(execution["prompt_template"], args)
+        if not isinstance(prompt, str) or not 1 <= len(prompt) <= 20000:
+            raise spending.BudgetDenied("Use a hosted prompt of 1-20,000 characters")
+        return spending.quote(execution["model"], execution.get("max_tokens", 800))
+    if kind == "http_json" and execution.get("billing") != {"mode": "free"}:
+        raise spending.BudgetDenied("The owner must declare this HTTP route free; paid HTTP adapters are disabled")
+    if kind == "memorygate" and execution.get("operation") != "context":
+        raise spending.BudgetDenied("Delegated MemoryGate generation has no enforceable spending adapter")
+    return None
 
 
 def _dispatch_tool(tool: dict, args: dict) -> dict:
@@ -1181,7 +1210,14 @@ def _run_workflow_steps(steps: list, state: dict, actor: str, approval_granted: 
             call_args = {field["name"]: state["args"][field["name"]]
                          for field in tool.get("inputs", []) if field.get("name") in state["args"]}
             call_args.update(_workflow_value(step.get("args", {}), state))
-            result = invoke_tool(tool, call_args, actor, approval_granted=approval_granted)
+            parent_id = state.get("action_id")
+            child_id = ("child_" + hashlib.sha256(
+                f"{parent_id}:{state['count']}".encode()).hexdigest()) if parent_id else None
+            result = invoke_tool(tool, call_args, actor, approval_granted=approval_granted,
+                                 actor_id=state.get("actor_id"), action_id=child_id,
+                                 job_id=state.get("job_id"), parent_action_id=parent_id)
+            if result.get("code") in {"OUTCOME_UNKNOWN", "IN_PROGRESS"}:
+                deny("OUTCOME_UNKNOWN", "A child dispatch is uncertain; this workflow is held", 409)
         elif kind == "set":
             state["vars"][step.get("name", "value")] = _workflow_value(step.get("value"), state)
             result = {"code": "VALUE_SET", "name": step.get("name", "value")}
@@ -1530,6 +1566,19 @@ def list_automations(_tier: str = Depends(require_admin)):
     return control_plane.list_objects("automation")
 
 
+@app.get("/v2/actions")
+def list_actions(_tier: str = Depends(require_admin)):
+    return {"results": journal.list_actions()}
+
+
+@app.get("/v2/agent/actions/{action_id}")
+def agent_action(action_id: str, agent: dict = Depends(require_agent)):
+    record = journal.get(action_id)
+    if not record or record["actor_id"] != agent["id"]:
+        raise HTTPException(404, "action not found")
+    return journal.response(record)
+
+
 @app.get("/v2/automations/{automation_id}")
 def get_automation(automation_id: str, _tier: str = Depends(require_admin)):
     automation = control_plane.get("automation", automation_id)
@@ -1586,6 +1635,17 @@ def run_automation(automation_id: str, payload: V2Invoke, agent: dict = Depends(
         deny("TOOL_UNAVAILABLE", "Automation is not active", 404)
     if not control_plane.is_scoped(agent, f"automation:{automation_id}"):
         deny("POLICY_DENIED", "Your agent key is not allowed to run this automation")
+    if not payload.action_id:
+        deny("ACTION_ID_REQUIRED", "Supply a stable action_id for this workflow run", 422)
+    try:
+        previous = journal.existing(payload.action_id, "automation", automation_id, payload.args,
+                                    agent["id"], payload.job_id)
+    except (journal.ExecutionConflict, ValueError) as exc:
+        deny("ACTION_CONFLICT", str(exc), 409)
+    if previous:
+        return journal.response(previous)
+    if control_plane.settings().get("lockdown"):
+        deny("LOCKED_DOWN", "ToolGate is in lockdown mode", 423)
     errors = control_plane.validate_inputs(automation.get("inputs", []), payload.args)
     if errors:
         deny("VALIDATION_ERROR", "; ".join(errors), 422)
@@ -1595,13 +1655,7 @@ def run_automation(automation_id: str, payload: V2Invoke, agent: dict = Depends(
         deny("POLICY_DENIED", "This automation is permanently blocked by its owner policy")
     approval_granted = False
     if authorization != "auto":
-        if payload.approval_request_id:
-            approval_granted, reason = control_plane.consume_verification(
-                payload.approval_request_id, "automation", automation_id, payload.args,
-                automation.get("version"), agent["name"], agent["id"])
-            if not approval_granted:
-                deny("APPROVAL_INVALID", reason, 409, "Request a new confirmation for this exact automation run")
-        else:
+        if not payload.approval_request_id:
             expiry = int(control_plane.settings().get("default_confirmation_expiry_seconds", 60))
             request = control_plane.create_verification_request(
                 f"Run {automation['name']}",
@@ -1613,15 +1667,38 @@ def run_automation(automation_id: str, payload: V2Invoke, agent: dict = Depends(
                     "next_action": f"After approval, retry with --approval-request-id {request['id']}"}
     enforce_usage_limits("automation", automation, "automation_executed")
     limits = automation.get("policy", {}).get("usage_limits", {})
-    state = {"automation_id": automation_id, "args": payload.args, "vars": {}, "last": None,
+    def authorize(conn):
+        nonlocal approval_granted
+        if authorization != "auto":
+            approval_granted, reason = control_plane.consume_verification_in_transaction(
+                conn, payload.approval_request_id, "automation", automation_id, payload.args,
+                automation.get("version"), agent["name"], agent["id"])
+            if not approval_granted:
+                deny("APPROVAL_INVALID", reason, 409)
+    try:
+        record, dispatch = journal.begin(payload.action_id, "automation", automation_id,
+                                         payload.args, agent["id"], automation.get("version"),
+                                         job_id=payload.job_id, authorize=authorize)
+    except (journal.ExecutionConflict, ValueError) as exc:
+        deny("ACTION_CONFLICT", str(exc), 409)
+    if not dispatch:
+        return journal.response(record)
+    state = {"automation_id": automation_id, "action_id": payload.action_id,
+             "job_id": payload.job_id, "actor_id": agent["id"], "args": payload.args, "vars": {}, "last": None,
              "results": [], "count": 0, "max_steps": int(limits.get("max_steps", 100)),
              "started_at": time.monotonic(),
              "runtime_ceiling": min(int(limits.get("max_runtime_seconds", 30) or 30), 120)}
-    final = _run_workflow_steps(automation.get("workflow", []), state, agent["name"], approval_granted)
+    try:
+        final = _run_workflow_steps(automation.get("workflow", []), state, agent["name"], approval_granted)
+    except Exception:
+        journal.unknown(payload.action_id)
+        return journal.response(journal.get(payload.action_id))
+    envelope = {"code": "OK", "message": "Automation completed", "result": final,
+                "steps": state["results"], "variables": state["vars"]}
+    record = journal.finish(payload.action_id, envelope)
     control_plane.event("automation_executed", "info", "automation", automation_id, agent["name"],
                         {"steps": state["count"], "version": automation.get("version")})
-    return {"code": "OK", "message": "Automation completed", "result": final,
-            "steps": state["results"], "variables": state["vars"]}
+    return journal.response(record)
 
 
 @app.get("/v2/requests")
@@ -1687,3 +1764,52 @@ def list_events(limit: int = 100, _tier: str = Depends(require_admin)):
 @app.get("/v2/agent/events")
 def agent_events(limit: int = 50, _agent: dict = Depends(require_agent)):
     return [{key: event[key] for key in ("id", "event_type", "severity", "subject_type", "subject_id", "created_at")} for event in control_plane.events(limit)]
+
+
+class SpendPolicy(BaseModel):
+    enabled: StrictBool
+    cumulative_cap: StrictInt
+    max_job_cap: StrictInt
+
+
+class SpendPrice(BaseModel):
+    input_per_million: StrictInt
+    output_per_million: StrictInt
+    valid_until: float
+    source: str
+
+
+class SpendJob(BaseModel):
+    actor_id: str
+    root_action_id: str
+    cap: StrictInt
+
+
+@app.get("/v2/spending")
+def spending_status(_tier: str = Depends(require_admin)):
+    return spending.status()
+
+
+@app.put("/v2/spending/policy")
+def spending_policy(payload: SpendPolicy, _tier: str = Depends(require_admin)):
+    try:
+        return spending.configure(**payload.model_dump())
+    except spending.BudgetDenied as exc:
+        deny("BUDGET_DENIED", str(exc), 422)
+
+
+@app.put("/v2/spending/prices/{model}")
+def spending_price(model: str, payload: SpendPrice, _tier: str = Depends(require_admin)):
+    try:
+        spending.set_price(model, **payload.model_dump())
+        return {"model": model, **payload.model_dump()}
+    except spending.BudgetDenied as exc:
+        deny("BUDGET_DENIED", str(exc), 422)
+
+
+@app.post("/v2/spending/jobs")
+def spending_job(payload: SpendJob, _tier: str = Depends(require_admin)):
+    try:
+        return spending.create_job(**payload.model_dump())
+    except (spending.BudgetDenied, sqlite3.IntegrityError) as exc:
+        deny("BUDGET_DENIED", str(exc), 422)

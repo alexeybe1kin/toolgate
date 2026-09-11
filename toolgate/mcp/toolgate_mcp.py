@@ -154,6 +154,8 @@ def _tool_input_schema(tool: dict) -> dict:
         "type": "object",
         "properties": {
             "args": args,
+            "action_id": {"type": "string", "description": "Stable ID for one logical action; reuse on retry."},
+            "job_id": {"type": "string", "description": "Owner-issued budget job shared by this workflow."},
             "approval_request_id": {
                 "type": "string",
                 "description": "Exact approved request to consume once.",
@@ -207,7 +209,7 @@ def _invoke(tool_name: str, arguments: dict) -> dict:
         raise RuntimeError(
             "Tool unavailable for this key; refresh tools/list or ask the owner for scope"
         )
-    if set(arguments) - {"args", "approval_request_id"} or not isinstance(
+    if set(arguments) - {"args", "approval_request_id", "action_id", "job_id"} or not isinstance(
         arguments.get("args"), dict
     ):
         raise RuntimeError(

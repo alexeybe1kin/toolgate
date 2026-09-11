@@ -6,7 +6,7 @@ import json
 import re
 import time
 
-from toolgate.core import control_plane
+from toolgate.core import control_plane, spending
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS v2_actions (
@@ -48,6 +48,7 @@ class ExecutionConflict(ValueError):
 
 def initialize(conn) -> None:
     conn.executescript(SCHEMA)
+    spending.initialize(conn)
 
 
 def fingerprint(subject_type: str, subject_id: str, args: dict, actor_id: str,

@@ -380,6 +380,10 @@ def _searx(query: str, source: str, limit: int, recency_days: int, timeout: floa
 
 
 def _tavily(query: str, source: str, limit: int, recency_days: int, timeout: float) -> list[dict]:
+    raise ResearchError("Tavily is disabled until it has a bounded spending adapter; use SearXNG")
+
+
+def _tavily_unmetered(query: str, source: str, limit: int, recency_days: int, timeout: float) -> list[dict]:
     deadline = time.monotonic() + max(1.0, timeout)
     _require_provider_ready("tavily")
     token = vault.get_key("TAVILY_API_KEY")

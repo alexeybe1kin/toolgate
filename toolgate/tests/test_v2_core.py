@@ -167,7 +167,7 @@ class ControlPlaneTests(unittest.TestCase):
             "usageMetadata": {"promptTokenCount": 42, "candidatesTokenCount": 8, "totalTokenCount": 50},
         }
         execution = {
-            "type": "gemini_generate", "model": "gemini-3.5-flash-lite",
+            "type": "gemini_generate", "model": "gemini-2.5-flash-lite",
             "secret_ref": "GOOGLE_API_KEY", "prompt_template": "Review {prompt}",
             "max_tokens": 800, "temperature": 0, "timeout_seconds": 60,
         }
@@ -269,7 +269,7 @@ class ControlPlaneTests(unittest.TestCase):
         with patch.object(research.vault, "get_key", return_value="private-tavily-key"), \
              patch.object(research, "_public_https_url", return_value=True), \
              patch.object(research.httpx, "post", return_value=response) as request:
-            rows = research._tavily("monthly close pain", "general", 5, 30, 5)
+            rows = research._tavily_unmetered("monthly close pain", "general", 5, 30, 5)
         self.assertEqual("Manual close", rows[0]["title"])
         self.assertIn("Tavily extracted search content", rows[0]["document"])
         self.assertNotIn("private-tavily-key", str(rows))
@@ -290,7 +290,7 @@ class ControlPlaneTests(unittest.TestCase):
         with patch.object(research.vault, "get_key", return_value="private-tavily-key"), \
              patch.object(research, "_public_https_url", return_value=True), \
              patch.object(research.httpx, "post", return_value=response) as request:
-            rows = research._tavily("field service complaints", "reddit", 5, 30, 5)
+            rows = research._tavily_unmetered("field service complaints", "reddit", 5, 30, 5)
         payload = request.call_args.kwargs["json"]
         self.assertEqual(["reddit.com"], payload["include_domains"])
         self.assertNotIn("exclude_domains", payload)
@@ -856,9 +856,9 @@ class ControlPlaneTests(unittest.TestCase):
         with patch.object(research.vault, "get_key", return_value="private-key"), \
              patch.object(research.httpx, "post", return_value=response) as post:
             with self.assertRaises(httpx.HTTPStatusError):
-                research._tavily("invoice workflow", "general", 5, 30, 5)
+                research._tavily_unmetered("invoice workflow", "general", 5, 30, 5)
             with self.assertRaisesRegex(research.ResearchError, "temporarily unavailable"):
-                research._tavily("another workflow", "general", 5, 30, 5)
+                research._tavily_unmetered("another workflow", "general", 5, 30, 5)
         self.assertEqual(1, post.call_count)
 
     def test_producthunt_provider_is_permission_gated_and_locally_filtered(self):
