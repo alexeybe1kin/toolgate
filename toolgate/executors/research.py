@@ -7,9 +7,7 @@ handles rather than arbitrary URLs.
 from __future__ import annotations
 
 import html
-import ipaddress
 import re
-import socket
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -20,6 +18,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from toolgate.core import control_plane, vault
+from toolgate.core.public_https import public_client, public_url
 
 
 class ResearchError(RuntimeError):
@@ -233,22 +232,7 @@ def inspect_text(value: str) -> dict:
 
 
 def _public_https_url(url: str) -> bool:
-    parsed = urlsplit(url)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-        return False
-    if parsed.port not in {None, 443}:
-        return False
-    try:
-        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)}
-    except socket.gaierror:
-        return False
-    if not addresses:
-        return False
-    for address in addresses:
-        ip = ipaddress.ip_address(address)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
-            return False
-    return True
+    return public_url(url)
 
 
 def _normalize(title: object, url: object, snippet: object, source: str, published_at: object = None) -> dict | None:
@@ -1399,7 +1383,7 @@ def fetch(result_id: str, max_chars: int = 12000) -> dict:
     content_type = ""
     body = bytearray()
     try:
-        with httpx.Client(timeout=15, follow_redirects=False, headers=headers) as client:
+        with public_client(timeout=15, headers=headers) as client:
             current_url = url
             for redirect_count in range(4):
                 with client.stream("GET", current_url) as response:

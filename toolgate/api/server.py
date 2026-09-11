@@ -1,12 +1,10 @@
 """ToolGate v2 API: a typed, owner-controlled agent capability boundary."""
 import hashlib
 import hmac
-import ipaddress
 import json
 import os
 import re
 import secrets
-import socket
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from toolgate.core import control_plane, legacy_archive, vault
+from toolgate.core.public_https import DestinationDenied, public_client, public_url, resolve_public
 from toolgate.executors import research
 
 SERVICE_VERSION = "0.2.2"
@@ -663,18 +662,11 @@ def require_valid_tool_definition(tool: dict):
 
 
 def _public_destination(host: str) -> bool:
-    if host.lower() == "localhost":
-        return False
     try:
-        addresses = {item[4][0] for item in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
-    except socket.gaierror:
+        resolve_public(host)
+    except DestinationDenied:
         return False
-    for address in addresses:
-        ip = ipaddress.ip_address(address)
-        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
-                or ip.is_reserved or ip.is_unspecified):
-            return False
-    return bool(addresses)
+    return True
 
 
 def _render_template(value, args: dict):
@@ -713,7 +705,7 @@ def _execute_http_json(execution: dict, args: dict) -> dict:
     allowed_hosts = {str(host).lower() for host in execution["allowed_hosts"]}
     if parsed.scheme != "https" or not parsed.hostname or parsed.hostname.lower() not in allowed_hosts:
         deny("DESTINATION_DENIED", "The rendered destination is outside this tool's exact host allowlist")
-    if not _public_destination(parsed.hostname):
+    if not public_url(url):
         deny("DESTINATION_DENIED", "Public HTTP tools cannot reach private or unresolved network destinations")
     headers = {"Accept": "application/json", "User-Agent": "ToolGate/2.0"}
     for header, secret_ref in execution.get("secret_headers", {}).items():
@@ -724,7 +716,7 @@ def _execute_http_json(execution: dict, args: dict) -> dict:
     timeout = min(float(execution.get("timeout_seconds", 10)), 30)
     max_bytes = min(int(execution.get("max_response_bytes", 262144)), 1048576)
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=False, headers=headers) as client:
+        with public_client(timeout=timeout, headers=headers) as client:
             response = client.request(str(execution.get("method", "GET")).upper(), url,
                                       json=_render_template(execution.get("body"), args)
                                       if execution.get("body") is not None else None)
@@ -1399,12 +1391,16 @@ def check_service(service_id: str, _tier: str = Depends(require_admin)):
         raise HTTPException(422, "service has no health_url")
     parsed = urlsplit(health_url)
     allowed_internal = parsed.hostname in {"memorygate-api", "memorygate-ollama"} and parsed.scheme == "http"
-    allowed_public = parsed.scheme == "https" and parsed.hostname and _public_destination(parsed.hostname)
+    allowed_public = public_url(health_url)
     if not (allowed_internal or allowed_public):
         deny("DESTINATION_DENIED", "Service health destination is not allowed")
     try:
-        response = httpx.get(health_url, timeout=10, follow_redirects=False)
-        healthy = response.status_code < 400
+        if allowed_public:
+            with public_client(timeout=10) as client:
+                response = client.get(health_url)
+        else:
+            response = httpx.get(health_url, timeout=10, follow_redirects=False)
+        healthy = 200 <= response.status_code < 300
     except httpx.HTTPError:
         healthy = False
     updated = control_plane.update_service(service_id, {

@@ -7,6 +7,11 @@ a contract change and gets its own entry.
 
 ## Unreleased
 
+- Reject CGNAT/Tailscale and metadata destinations in public HTTPS research,
+  HTTP tools and public service-health probes. Validate all DNS answers at
+  connection time, pin the socket to a validated IP and disable environment
+  proxies. Preserve TLS hostname verification and check every research redirect.
+
 - Close forged verification creation through both generic request endpoints. Only
   invocation can issue a verification, with immutable issuance provenance.
 - Cancel old unconsumed verifications on upgrade; their origin cannot be trusted.

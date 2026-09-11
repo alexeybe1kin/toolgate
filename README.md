@@ -62,6 +62,18 @@ ToolGate reduces agent and prompt-injection risk, but it cannot protect a host t
 
 Research tools accept typed queries and fixed source names, not arbitrary URLs. Search results become short-lived server-issued handles; the fetch tool resolves only those handles, revalidates every HTTPS redirect and public destination, restricts content types, and stops while streaming once 512 KiB of decompressed content is reached.
 
+Public fetches and `http_json` use the same socket-level boundary. Every DNS answer must be
+globally routable; CGNAT/Tailscale, private, loopback, link-local, multicast, reserved and metadata
+destinations are rejected, as are IPv6 transition addresses that can encode another destination.
+The connection uses a validated numeric address, retaining the original HTTP Host, TLS SNI and
+certificate verification. Environment proxies are disabled for these public requests. Every
+research redirect is checked again; `http_json` refuses redirects entirely. Public service-health
+probes use the same transport. Explicit internal MemoryGate probes retain their separate policy.
+
+These checks do not require a reachable tailnet. Tests control DNS and the socket boundary and
+prove that denied destinations are never connected to; deployment routing and actual tailnet
+reachability still require a check on the owner's host. Host egress rules remain a separate layer.
+
 HTML is reduced before model use: scripts, styles, SVG, hidden elements, navigation, forms, page chrome, cookie prompts, subscription prompts, and repeated lines are removed. Unicode control characters are normalized, search-provider markup is stripped, long encoded blobs and instruction/exfiltration patterns are blocked, and surviving text is enclosed in an explicit untrusted-content boundary. These controls reduce both tokens and attack surface, but retrieved content must still be treated as hostile evidence rather than instructions.
 
 Product Hunt can be used as an optional read-only competition provider. Because Product Hunt requires separate permission for commercial API use, ToolGate keeps it disabled until the owner confirms that approval in Settings and stores `PRODUCTHUNT_TOKEN` through Secrets. The token remains in ToolGate; the caller receives only locally filtered, redacted product metadata. SearXNG remains the automatic fallback.
