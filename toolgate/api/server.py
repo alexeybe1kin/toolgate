@@ -1817,3 +1817,16 @@ def spending_job(payload: SpendJob, _tier: str = Depends(require_admin)):
         return spending.create_job(**payload.model_dump())
     except (spending.BudgetDenied, sqlite3.IntegrityError) as exc:
         deny("BUDGET_DENIED", str(exc), 422)
+
+
+class ReservationRelease(BaseModel):
+    confirmed_not_executed: StrictBool
+    evidence: str
+
+
+@app.post("/v2/spending/releases/{action_id:path}")
+def release_reservation(action_id: str, payload: ReservationRelease, _tier: str = Depends(require_admin)):
+    try:
+        return spending.release_hold(action_id, payload.evidence, payload.confirmed_not_executed)
+    except spending.BudgetDenied as exc:
+        deny("RELEASE_DENIED", str(exc), 409)

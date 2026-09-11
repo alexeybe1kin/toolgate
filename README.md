@@ -319,3 +319,5 @@ toolgate/tests/            Deterministic security, workflow, research, and MCP t
 ToolGate v2 deliberately starts from a clean control-plane model. Deprecated legacy registries, unrestricted scripts, and old execution paths are not migrated.
 
 Automation confirmations bind every referenced child definition and version, including nested branches. Changes before dispatch require fresh approval; accepted runs use the checked snapshot. Legacy automation approvals without child bindings are rejected.
+
+Owners can release a verified no-execution hold using `POST /v2/spending/releases/{action_id}` with `confirmed_not_executed: true` and an evidence note. This changes local budget availability only; it never refunds a provider or permits redispatch. A late provider reply disputes the release, restores accounting, and freezes paid work.

@@ -208,8 +208,8 @@ MUTANTS.extend([('dispatch without a committed record',
   'toolgate/tests/test_spending.py::test_reservation_precedes_network_reconciles_and_replay_does_not_charge'),
  ('provider bound violation does not freeze paid dispatch',
   'toolgate/core/spending.py',
-  'conn.execute("UPDATE v2_spend_policy SET enabled=0 WHERE id=1")',
-  'pass',
+  '        conn.execute("UPDATE v2_spend_policy SET enabled=0 WHERE id=1")\n        actual = max(actual, row["reserved"])',
+  '        actual = max(actual, row["reserved"])',
   'toolgate/tests/test_spending.py::test_provider_bound_violation_disables_further_paid_dispatch'),
  ('approval committed before journal insert',
   'toolgate/core/execution_journal.py',
@@ -267,6 +267,23 @@ MUTANTS.extend([
     ("automation child snapshot discarded", "toolgate/api/server.py",
      '"tool_snapshot": tool_snapshot,', '',
      "toolgate/tests/test_automation_approval.py::test_edit_after_consumption_cannot_replace_pinned_child"),
+])
+
+
+MUTANTS.extend([
+    ("worker-can-release-spending", "toolgate/api/server.py",
+     'def release_reservation(action_id: str, payload: ReservationRelease, _tier: str = Depends(require_admin)):',
+     'def release_reservation(action_id: str, payload: ReservationRelease, _tier: dict = Depends(require_agent)):',
+     "toolgate/tests/test_reservation_release.py::test_owner_release_frees_local_hold_without_allowing_redispatch"),
+    ("release-ignores-live-dispatch", "toolgate/core/spending.py",
+     'or action["status"] != "outcome_unknown"', '',
+     "toolgate/tests/test_reservation_release.py::test_release_requires_owner_evidence_and_inactive_dispatch"),
+    ("released-hold-still-consumes-budget", "toolgate/core/spending.py",
+     'THEN 0 ELSE r.reserved END', 'THEN r.reserved ELSE r.reserved END',
+     "toolgate/tests/test_reservation_release.py::test_owner_release_frees_local_hold_without_allowing_redispatch"),
+    ("late-reply-does-not-dispute-release", "toolgate/core/spending.py",
+     'if conn.execute("SELECT 1 FROM v2_spend_releases WHERE action_id=?", (action_id,)).fetchone():',
+     'if False:', "toolgate/tests/test_reservation_release.py::test_late_reply_disputes_release_and_restores_budget_hold"),
 ])
 
 

@@ -102,9 +102,16 @@ control. Discounted/cached usage is conservatively charged at the recorded rates
 - Pi must persist/send action IDs and propagate job IDs. Its code and Companion
   were intentionally not edited. Callers without IDs now fail before outbound
   dispatch, rather than receiving a server-generated identity they could lose.
-- Unknown outcomes and unresolved reservations have no reset/refund endpoint.
-  Provider reconciliation and an audited owner resolution flow are follow-up work;
-  do not clear a record or mint a replacement action to force a retry.
+- Owners may release a local hold only after verifying the action did not execute:
+  `POST /v2/spending/releases/{action_id}` with `confirmed_not_executed: true` and
+  an `evidence` note describing the provider check. Only `outcome_unknown` actions
+  with unresolved billing qualify. Identical repeats return the immutable receipt.
+  The action remains non-retryable; no provider refund or successful reconciliation
+  is claimed. A late provider reply disputes the release, restores conservative
+  accounting (or known usage), and disables paid work. Stop active workers and
+  verify the provider outcome before attesting; the server cannot verify that claim.
+  Resolving a disputed release and reconciling nonzero owner-reported charges remain
+  follow-up work. Never mint a replacement action to force a retry.
 - Backup/restore must preserve all `v2_actions` and `v2_spend_*` tables. Restoring an
   old snapshot can omit later actions/costs; keep paid execution isolated until
   those are reconciled externally. This patch does not change Companion recovery.

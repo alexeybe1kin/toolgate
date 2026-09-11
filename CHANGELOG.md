@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- F10: Add owner-attested, audited local hold releases while preserving unknown action identity; contradictory late replies freeze paid dispatch.
+
 - Bind automation approval to child definitions and execute the checked snapshot, preventing an owner edit from widening an existing approval.
 
 - Persist stable tool/workflow dispatch identities before execution; atomically consume approval and reserve paid cost. Replays return recorded status; ambiguous interruptions hold without redispatch.

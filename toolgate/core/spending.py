@@ -29,6 +29,23 @@ CREATE TABLE IF NOT EXISTS v2_spend_reservations (
     job_id TEXT NOT NULL REFERENCES v2_spend_jobs(job_id),
     reserved INTEGER NOT NULL, accounted INTEGER, quote TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS v2_spend_releases (
+    action_id TEXT PRIMARY KEY, evidence TEXT NOT NULL, released_at REAL NOT NULL,
+    actor TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS v2_spend_release_disputes (action_id TEXT PRIMARY KEY);
+CREATE TRIGGER IF NOT EXISTS v2_spend_releases_no_update BEFORE UPDATE ON v2_spend_releases
+BEGIN SELECT RAISE(ABORT, 'release receipts are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS v2_spend_releases_no_delete BEFORE DELETE ON v2_spend_releases
+BEGIN SELECT RAISE(ABORT, 'release receipts are permanent'); END;
+CREATE TRIGGER IF NOT EXISTS v2_spend_releases_no_replace BEFORE INSERT ON v2_spend_releases
+WHEN EXISTS(SELECT 1 FROM v2_spend_releases WHERE action_id=NEW.action_id)
+BEGIN SELECT RAISE(ABORT, 'release receipt already exists'); END;
+CREATE VIEW IF NOT EXISTS v2_spend_effective AS
+SELECT r.*, COALESCE(r.accounted, CASE WHEN o.action_id IS NOT NULL AND d.action_id IS NULL
+    THEN 0 ELSE r.reserved END) AS effective
+FROM v2_spend_reservations r LEFT JOIN v2_spend_releases o USING(action_id)
+LEFT JOIN v2_spend_release_disputes d USING(action_id);
 CREATE TRIGGER IF NOT EXISTS v2_spend_jobs_no_update BEFORE UPDATE ON v2_spend_jobs
 BEGIN SELECT RAISE(ABORT, 'job ceilings and identity are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS v2_spend_jobs_no_delete BEFORE DELETE ON v2_spend_jobs
@@ -159,10 +176,10 @@ def reserve(conn, action_id: str, job_id: str | None, actor_id: str,
     if root != job["root_action_id"]:
         raise BudgetDenied("Child spending belongs to another root job")
     reserved = amount(price, price["max_input_tokens"], price["max_output_tokens"])
-    used = conn.execute("SELECT COALESCE(SUM(COALESCE(accounted,reserved)),0)"
-                        " FROM v2_spend_reservations").fetchone()[0]
-    job_used = conn.execute("SELECT COALESCE(SUM(COALESCE(accounted,reserved)),0)"
-                            " FROM v2_spend_reservations WHERE job_id=?", (job_id,)).fetchone()[0]
+    used = conn.execute("SELECT COALESCE(SUM(effective),0)"
+                        " FROM v2_spend_effective").fetchone()[0]
+    job_used = conn.execute("SELECT COALESCE(SUM(effective),0)"
+                            " FROM v2_spend_effective WHERE job_id=?", (job_id,)).fetchone()[0]
     if used + reserved > policy["cumulative_cap"] or job_used + reserved > job["cap"]:
         raise BudgetDenied("The conservative reservation exceeds the job or cumulative spending ceiling")
     conn.execute("INSERT INTO v2_spend_reservations VALUES (?,?,?,NULL,?)",
@@ -173,6 +190,11 @@ def reconcile(conn, action_id: str, usage: dict | None) -> None:
     row = conn.execute("SELECT * FROM v2_spend_reservations WHERE action_id=?", (action_id,)).fetchone()
     if not row:
         return
+    if conn.execute("SELECT 1 FROM v2_spend_releases WHERE action_id=?", (action_id,)).fetchone():
+        # A late provider reply contradicts the owner's no-effect assertion. Restore
+        # conservative accounting and freeze paid work instead of trusting the release.
+        conn.execute("INSERT INTO v2_spend_release_disputes VALUES (?) ON CONFLICT DO NOTHING", (action_id,))
+        conn.execute("UPDATE v2_spend_policy SET enabled=0 WHERE id=1")
     price = json.loads(row["quote"])
     usage = usage or {}
     incoming, outgoing = usage.get("prompt_tokens"), usage.get("completion_tokens")
@@ -192,8 +214,33 @@ def status() -> dict:
     with control_plane._conn() as conn:
         initialize(conn)
         policy = conn.execute("SELECT * FROM v2_spend_policy WHERE id=1").fetchone()
-        used = conn.execute("SELECT COALESCE(SUM(COALESCE(accounted,reserved)),0),"
-                            " COALESCE(SUM(CASE WHEN accounted IS NULL THEN reserved ELSE 0 END),0)"
-                            " FROM v2_spend_reservations").fetchone()
+        used = conn.execute("SELECT COALESCE(SUM(effective),0),"
+                            " COALESCE(SUM(CASE WHEN accounted IS NULL THEN effective ELSE 0 END),0)"
+                            " FROM v2_spend_effective").fetchone()
         return {"policy": dict(policy) if policy else {"enabled": 0},
                 "accounted_and_reserved_microusd": used[0], "held_microusd": used[1]}
+
+
+def release_hold(action_id: str, evidence: str, confirmed_not_executed: bool) -> dict:
+    from toolgate.core import execution_journal
+
+    if confirmed_not_executed is not True or not isinstance(evidence, str) or not 10 <= len(evidence.strip()) <= 2000:
+        raise BudgetDenied("Confirm the action did not execute and record how you checked with the provider")
+    with control_plane._conn() as conn:
+        execution_journal.initialize(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        action = conn.execute("SELECT * FROM v2_actions WHERE action_id=?", (action_id,)).fetchone()
+        row = conn.execute("SELECT * FROM v2_spend_reservations WHERE action_id=?", (action_id,)).fetchone()
+        if not action or action["status"] != "outcome_unknown" or not row or row["accounted"] is not None:
+            raise BudgetDenied("Only an unresolved held action can be released; verify its outcome first")
+        if conn.execute("SELECT 1 FROM v2_spend_release_disputes WHERE action_id=?", (action_id,)).fetchone():
+            raise BudgetDenied("A provider reply disputed this release; reconcile externally before changing the policy")
+        previous = conn.execute("SELECT * FROM v2_spend_releases WHERE action_id=?", (action_id,)).fetchone()
+        if previous:
+            if previous["evidence"] != evidence.strip():
+                raise BudgetDenied("This release already has an immutable owner receipt")
+            return {**dict(previous), "status": "local_hold_released", "released_microusd": row["reserved"]}
+        conn.execute("INSERT INTO v2_spend_releases VALUES (?,?,?,?)",
+                     (action_id, evidence.strip(), time.time(), "owner"))
+        receipt = dict(conn.execute("SELECT * FROM v2_spend_releases WHERE action_id=?", (action_id,)).fetchone())
+        return {**receipt, "status": "local_hold_released", "released_microusd": row["reserved"]}
