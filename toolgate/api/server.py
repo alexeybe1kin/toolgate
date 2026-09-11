@@ -7,6 +7,7 @@ import re
 import secrets
 import sqlite3
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
@@ -16,7 +17,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from toolgate.core import control_plane, legacy_archive, vault
+from toolgate.core import control_plane, execution_journal as journal, legacy_archive, vault
 from toolgate.core.public_https import DestinationDenied, public_client, public_url, resolve_public
 from toolgate.executors import research
 
@@ -57,6 +58,7 @@ def startup():
         raise RuntimeError("AI archive migration failed; keep ToolGate stopped, preserve toolgate.db, "
                            "and inspect the migration error before retrying") from exc
     control_plane.invalidate_legacy_verifications()
+    journal.recover_interrupted()
     generated = vault.ensure_control_keys()
     for name in generated:
         print(f"[toolgate] generated and persisted {name}; value intentionally not logged")
@@ -424,6 +426,8 @@ class V2RequestDecision(BaseModel):
 class V2Invoke(BaseModel):
     args: dict = {}
     approval_request_id: str | None = None
+    action_id: str | None = None
+    job_id: str | None = None
 
 
 class V2Settings(BaseModel):
@@ -908,7 +912,18 @@ def _shape_tool_result(tool: dict, result: dict) -> dict:
 
 
 def invoke_tool(tool: dict, args: dict, actor: str, *, approval_request_id: str | None = None,
-                approval_granted: bool = False, actor_id: str | None = None) -> dict:
+                approval_granted: bool = False, actor_id: str | None = None,
+                action_id: str | None = None, job_id: str | None = None,
+                parent_action_id: str | None = None) -> dict:
+    identity = actor_id or actor
+    if action_id:
+        try:
+            previous = journal.existing(action_id, "tool", tool["id"], args, identity,
+                                        job_id, parent_action_id)
+        except (journal.ExecutionConflict, ValueError) as exc:
+            deny("ACTION_CONFLICT", str(exc), 409)
+        if previous:
+            return journal.response(previous)
     if control_plane.settings().get("lockdown"):
         control_plane.event("execution_blocked", "critical", "tool", tool["id"], actor, {"code": "LOCKED_DOWN"})
         deny("LOCKED_DOWN", "ToolGate is in lockdown mode", 423, "Ask the owner to unlock ToolGate")
@@ -921,12 +936,7 @@ def invoke_tool(tool: dict, args: dict, actor: str, *, approval_request_id: str 
         control_plane.event("execution_blocked", "warning", "tool", tool["id"], actor, {"code": "POLICY_DENIED"})
         deny("POLICY_DENIED", "This tool is permanently blocked by its owner policy")
     if authorization in {"owner_confirmation", "ai_review"} and not approval_granted:
-        if approval_request_id:
-            approved, reason = control_plane.consume_verification(
-                approval_request_id, "tool", tool["id"], args, tool.get("version"), actor, actor_id)
-            if not approved:
-                deny("APPROVAL_INVALID", reason, 409, "Request a new confirmation for this exact action")
-        else:
+        if not approval_request_id:
             expiry = int(control_plane.settings().get("default_confirmation_expiry_seconds", 60))
             request = control_plane.create_verification_request(
                 f"Run {tool['name']}",
@@ -936,6 +946,38 @@ def invoke_tool(tool: dict, args: dict, actor: str, *, approval_request_id: str 
                     "request_id": request["id"], "expires_at": request["payload"]["binding"]["expires_at"],
                     "next_action": f"After approval, retry with --approval-request-id {request['id']}"}
     enforce_usage_limits("tool", tool, "tool_executed")
+    if not action_id:
+        if tool.get("execution", {}).get("type") not in {"echo", "local_echo"}:
+            deny("ACTION_ID_REQUIRED", "Supply a stable action_id before dispatch; reuse it when checking or retrying", 422)
+        action_id = "local_" + uuid.uuid4().hex
+
+    def authorize(conn):
+        if authorization in {"owner_confirmation", "ai_review"} and not approval_granted:
+            approved, reason = control_plane.consume_verification_in_transaction(
+                conn, approval_request_id, "tool", tool["id"], args, tool.get("version"), actor, actor_id)
+            if not approved:
+                deny("APPROVAL_INVALID", reason, 409, "Request a new confirmation for this exact action")
+    try:
+        record, dispatch = journal.begin(action_id, "tool", tool["id"], args, identity,
+                                         tool.get("version"), job_id=job_id,
+                                         parent_action_id=parent_action_id, authorize=authorize)
+    except (journal.ExecutionConflict, ValueError) as exc:
+        deny("ACTION_CONFLICT", str(exc), 409)
+    if not dispatch:
+        return journal.response(record)
+    try:
+        result = _dispatch_tool(tool, args)
+    except Exception:
+        journal.unknown(action_id)
+        return journal.response(journal.get(action_id))
+    envelope = {"code": "OK" if result["ok"] else "TOOL_UNAVAILABLE",
+                "message": "Tool completed" if result["ok"] else result["error"], "result": result}
+    record = journal.finish(action_id, envelope)
+    control_plane.event("tool_executed", "info" if result["ok"] else "warning", "tool", tool["id"], actor, {"ok": result["ok"], "action_id": action_id})
+    return journal.response(record)
+
+
+def _dispatch_tool(tool: dict, args: dict) -> dict:
     # v2 executes only typed, declared executors. Arbitrary Python is intentionally unsupported.
     executor_type = tool.get("execution", {}).get("type")
     if executor_type == "echo":
@@ -961,8 +1003,8 @@ def invoke_tool(tool: dict, args: dict, actor: str, *, approval_request_id: str 
     else:
         result = {"ok": False, "error": "No restricted executor is configured for this typed tool."}
     result = _shape_tool_result(tool, result)
-    control_plane.event("tool_executed", "info" if result["ok"] else "warning", "tool", tool["id"], actor, {"ok": result["ok"]})
-    return {"code": "OK" if result["ok"] else "TOOL_UNAVAILABLE", "message": "Tool completed" if result["ok"] else result["error"], "result": result}
+    return result
+
 
 
 SUPPORTED_WORKFLOW_BLOCKS = {
@@ -1480,7 +1522,7 @@ def run_tool(tool_id: str, payload: V2Invoke, agent: dict = Depends(require_agen
     if tool.get("status") != "active" or not control_plane.is_scoped(agent, tool_id):
         deny("POLICY_DENIED", "Your agent key is not allowed to use this tool", 403, "Ask the owner for scope")
     return invoke_tool(tool, payload.args, agent["name"], approval_request_id=payload.approval_request_id,
-                       actor_id=agent["id"])
+                       actor_id=agent["id"], action_id=payload.action_id, job_id=payload.job_id)
 
 
 @app.get("/v2/automations")

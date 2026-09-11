@@ -594,38 +594,45 @@ def consume_verification(request_id: str, subject_type: str, subject_id: str,
     """Atomically consume an approved action binding exactly once."""
     with _conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        now = datetime.now(timezone.utc)
-        row = conn.execute("SELECT * FROM v2_objects WHERE kind='request' AND id=?", (request_id,)).fetchone()
-        if not row:
-            return False, "Approval request was not found"
-        record = _row(row)
-        binding = record.get("payload", {}).get("binding", {})
-        if record.get("kind") != "verification" or record.get("status") != "approved":
-            return False, f"Approval request is {record.get('status', 'invalid')}"
-        if not _verification_origin_valid(conn, record):
-            return False, "Approval was not issued intact by ToolGate; request fresh confirmation"
-        created_by = record.get("payload", {}).get("created_by_agent_key")
-        if not created_by or actor_id != created_by:
-            return False, "Approval request belongs to a different originating agent"
-        if binding.get("consumed_at"):
-            return False, "Approval request has already been consumed"
-        try:
-            expires_at = datetime.fromisoformat(binding["expires_at"])
-        except (KeyError, TypeError, ValueError):
-            return False, "Approval request has an invalid expiry"
-        if expires_at.tzinfo is None:
-            return False, "Approval request has an invalid expiry"
-        if expires_at <= now:
-            return False, "Approval request has expired"
-        expected = action_digest(subject_type, subject_id, args, version)
-        if not secrets.compare_digest(str(binding.get("args_digest", "")), expected):
-            return False, "Approval does not match this exact action"
-        binding["consumed_at"] = now.isoformat()
-        binding["consumed_by"] = actor
-        record["payload"]["binding"] = binding
-        _save_request(conn, record)
-        _request_event(conn, "verification_consumed", "info", request_id, actor,
-                       {"subject_type": subject_type, "subject_id": subject_id})
+        return consume_verification_in_transaction(
+            conn, request_id, subject_type, subject_id, args, version, actor, actor_id)
+
+
+def consume_verification_in_transaction(conn, request_id: str, subject_type: str, subject_id: str,
+                                        args: dict, version: int | None, actor: str,
+                                        actor_id: str | None = None) -> tuple[bool, str]:
+    now = datetime.now(timezone.utc)
+    row = conn.execute("SELECT * FROM v2_objects WHERE kind='request' AND id=?", (request_id,)).fetchone()
+    if not row:
+        return False, "Approval request was not found"
+    record = _row(row)
+    binding = record.get("payload", {}).get("binding", {})
+    if record.get("kind") != "verification" or record.get("status") != "approved":
+        return False, f"Approval request is {record.get('status', 'invalid')}"
+    if not _verification_origin_valid(conn, record):
+        return False, "Approval was not issued intact by ToolGate; request fresh confirmation"
+    created_by = record.get("payload", {}).get("created_by_agent_key")
+    if not created_by or actor_id != created_by:
+        return False, "Approval request belongs to a different originating agent"
+    if binding.get("consumed_at"):
+        return False, "Approval request has already been consumed"
+    try:
+        expires_at = datetime.fromisoformat(binding["expires_at"])
+    except (KeyError, TypeError, ValueError):
+        return False, "Approval request has an invalid expiry"
+    if expires_at.tzinfo is None:
+        return False, "Approval request has an invalid expiry"
+    if expires_at <= now:
+        return False, "Approval request has expired"
+    expected = action_digest(subject_type, subject_id, args, version)
+    if not secrets.compare_digest(str(binding.get("args_digest", "")), expected):
+        return False, "Approval does not match this exact action"
+    binding["consumed_at"] = now.isoformat()
+    binding["consumed_by"] = actor
+    record["payload"]["binding"] = binding
+    _save_request(conn, record)
+    _request_event(conn, "verification_consumed", "info", request_id, actor,
+                   {"subject_type": subject_type, "subject_id": subject_id})
     return True, "approved"
 
 
