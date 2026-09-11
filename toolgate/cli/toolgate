@@ -9,6 +9,7 @@ import os
 import sys
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 CONFIG_PATH = Path(os.environ.get("TOOLGATE_CONFIG", Path.home() / ".config" / "toolgate" / "credentials.env"))
@@ -148,7 +149,7 @@ def main():
         if command == "action" and len(args) >= 2 and args.pop(0) == "status":
             action_id = args.pop(0)
             _, output_json = _flags(args)
-            return _request("GET", f"/v2/agent/actions/{action_id}", output_json=output_json)
+            return _request("GET", "/v2/agent/actions/" + quote(action_id, safe=""), output_json=output_json)
         if command in {"update", "watch"}:
             _, output_json = _flags(args)
             return _request("GET", "/v2/agent/events", output_json=output_json)

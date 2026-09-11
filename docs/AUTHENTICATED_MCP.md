@@ -33,3 +33,10 @@ action. Check execution records before retrying an uncertain outcome.
 
 Memory retrieval and skill injection are not transport responsibilities. They
 belong in Pi; the bridge reads neither the ToolGate vault nor MemoryGate keys.
+
+
+Outbound invocation envelopes must now include a caller-persisted `action_id` and,
+for paid routes, the owner's `job_id`, alongside `args` and any
+`approval_request_id`. Reuse the same ID when checking/retrying a logical action;
+never turn an `OUTCOME_UNKNOWN` response into a new invocation. See
+[durability and spending](DURABLE_EXECUTION_AND_SPENDING.md) for the full contract.

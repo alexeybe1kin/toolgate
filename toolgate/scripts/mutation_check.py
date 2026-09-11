@@ -252,7 +252,12 @@ MUTANTS.extend([('dispatch without a committed record',
   'toolgate/api/server.py',
   'job_id=state.get("job_id"), parent_action_id=parent_id)',
   'job_id=None, parent_action_id=parent_id)',
-  'toolgate/tests/test_spending.py::test_workflow_children_share_job_ceiling_and_cannot_resume_partial_run')])
+  'toolgate/tests/test_spending.py::test_workflow_children_share_job_ceiling_and_cannot_resume_partial_run'),
+ ('stale quote accepted after owner price refresh',
+  'toolgate/core/spending.py',
+  'if not current_price or any(price[key] != current_price[key] for key in current_price.keys()):',
+  'if False:',
+  'toolgate/tests/test_spending.py::test_price_change_before_reservation_cannot_use_old_rates')])
 
 
 def run_tests(root: Path, tests: list[str], name: str) -> subprocess.CompletedProcess:

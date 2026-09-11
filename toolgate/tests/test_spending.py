@@ -11,7 +11,8 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from toolgate.api import server
-from toolgate.core import control_plane, execution_journal as journal, spending
+from toolgate.core import control_plane, spending
+from toolgate.core import execution_journal as journal
 from toolgate.executors import research
 
 
@@ -260,3 +261,15 @@ def test_budget_policy_changes_do_not_reset_cumulative_usage(paid, monkeypatch):
     spending.configure(False, 100, 100)
     spending.configure(True, 100, 100)
     assert spending.status()["accounted_and_reserved_microusd"] == 58
+
+
+def test_price_change_before_reservation_cannot_use_old_rates(paid):
+    job = setup_budget()
+    price = spending.quote(spending.MODEL, 128)
+    spending.set_price(spending.MODEL, 9_000_000, 9_000_000,
+                       time.time() + 3600, "https://provider.example/pricing")
+    with pytest.raises(spending.BudgetDenied, match="Pricing changed"):
+        journal.begin("root", "tool", "paid", {}, "agent", 1, job_id=job,
+                      reserve=lambda db: spending.reserve(db, "root", job, "agent", None, price))
+    assert journal.get("root") is None
+    assert spending.status()["accounted_and_reserved_microusd"] == 0

@@ -141,10 +141,10 @@ Core commands:
 toolgate status
 toolgate tool list
 toolgate tool <name> info
-toolgate tool <name> --argument value
+toolgate tool <name> --action-id <stable-id> --argument value
 toolgate automation list
 toolgate automation <name> info
-toolgate automation <name> run --argument value
+toolgate automation <name> run --action-id <stable-id> --argument value
 toolgate request create-tool "Describe the capability needed"
 toolgate request status <id>
 toolgate update

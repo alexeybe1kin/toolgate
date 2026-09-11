@@ -2406,6 +2406,318 @@
           }
         }
       }
+    },
+    "/v2/actions": {
+      "get": {
+        "summary": "List Actions",
+        "operationId": "list_actions_v2_actions_get",
+        "parameters": [
+          {
+            "name": "X-ToolGate-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Toolgate-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/agent/actions/{action_id}": {
+      "get": {
+        "summary": "Agent Action",
+        "operationId": "agent_action_v2_agent_actions__action_id__get",
+        "parameters": [
+          {
+            "name": "action_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Action Id"
+            }
+          },
+          {
+            "name": "X-ToolGate-Execution-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Toolgate-Execution-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/spending": {
+      "get": {
+        "summary": "Spending Status",
+        "operationId": "spending_status_v2_spending_get",
+        "parameters": [
+          {
+            "name": "X-ToolGate-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Toolgate-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/spending/policy": {
+      "put": {
+        "summary": "Spending Policy",
+        "operationId": "spending_policy_v2_spending_policy_put",
+        "parameters": [
+          {
+            "name": "X-ToolGate-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Toolgate-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpendPolicy"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/spending/prices/{model}": {
+      "put": {
+        "summary": "Spending Price",
+        "operationId": "spending_price_v2_spending_prices__model__put",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Model"
+            }
+          },
+          {
+            "name": "X-ToolGate-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Toolgate-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpendPrice"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/spending/jobs": {
+      "post": {
+        "summary": "Spending Job",
+        "operationId": "spending_job_v2_spending_jobs_post",
+        "parameters": [
+          {
+            "name": "X-ToolGate-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Toolgate-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpendJob"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2586,6 +2898,28 @@
               }
             ],
             "title": "Approval Request Id"
+          },
+          "action_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action Id"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
           }
         },
         "type": "object",
@@ -2898,6 +3232,80 @@
           "secret_ref"
         ],
         "title": "VerificationMethodCreate"
+      },
+      "SpendPolicy": {
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          },
+          "cumulative_cap": {
+            "type": "integer",
+            "title": "Cumulative Cap"
+          },
+          "max_job_cap": {
+            "type": "integer",
+            "title": "Max Job Cap"
+          }
+        },
+        "type": "object",
+        "required": [
+          "enabled",
+          "cumulative_cap",
+          "max_job_cap"
+        ],
+        "title": "SpendPolicy"
+      },
+      "SpendPrice": {
+        "properties": {
+          "input_per_million": {
+            "type": "integer",
+            "title": "Input Per Million"
+          },
+          "output_per_million": {
+            "type": "integer",
+            "title": "Output Per Million"
+          },
+          "valid_until": {
+            "type": "number",
+            "title": "Valid Until"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          }
+        },
+        "type": "object",
+        "required": [
+          "input_per_million",
+          "output_per_million",
+          "valid_until",
+          "source"
+        ],
+        "title": "SpendPrice"
+      },
+      "SpendJob": {
+        "properties": {
+          "actor_id": {
+            "type": "string",
+            "title": "Actor Id"
+          },
+          "root_action_id": {
+            "type": "string",
+            "title": "Root Action Id"
+          },
+          "cap": {
+            "type": "integer",
+            "title": "Cap"
+          }
+        },
+        "type": "object",
+        "required": [
+          "actor_id",
+          "root_action_id",
+          "cap"
+        ],
+        "title": "SpendJob"
       }
     }
   }

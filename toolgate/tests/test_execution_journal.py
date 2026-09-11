@@ -6,7 +6,8 @@ import pytest
 from fastapi import HTTPException
 
 from toolgate.api import server
-from toolgate.core import control_plane, execution_journal as journal
+from toolgate.core import control_plane
+from toolgate.core import execution_journal as journal
 
 
 @pytest.fixture

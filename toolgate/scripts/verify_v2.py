@@ -18,6 +18,7 @@ import hmac
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -28,7 +29,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from toolgate.core import vault  # noqa: E402
-
 
 API = "http://127.0.0.1:8010"
 TOOL_ID = "verify-owner-confirmation"
@@ -42,6 +42,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> None:
+    run_id = "verify-" + uuid.uuid4().hex
     agent_env = dotenv_values(Path.home() / ".config" / "toolgate" / "credentials.env")
     owner_key = vault.get_control_key("TOOLGATE_ADMIN_KEY")
     execution_key = agent_env.get("TOOLGATE_EXECUTION_KEY")
@@ -132,15 +133,19 @@ def main() -> None:
         check(response.status_code == 422, "unsafe POST definition was accepted without owner confirmation")
 
         response = execute("POST", "/v2/tools/memorygate-context/invoke",
-                           json={"args": {"query": "ToolGate integration health", "max_items": 3, "include_evidence": False}})
+                           json={"action_id": run_id + "-memory", "args": {"query": "ToolGate integration health", "max_items": 3, "include_evidence": False}})
         check(response.status_code == 200 and response.json().get("code") == "OK", "MemoryGate context failed through ToolGate")
-        response = execute("POST", "/v2/tools/github-repos-count/invoke", json={"args": {"username": "alexeybe1kin"}})
+        configured_http = admin("GET", "/v2/tools/github-repos-count").json()
+        check(configured_http.get("execution", {}).get("billing") == {"mode": "free"},
+              "Owner action required: review github-repos-count and declare execution.billing as mode=free before verification")
+        response = execute("POST", "/v2/tools/github-repos-count/invoke",
+                           json={"action_id": run_id + "-github", "args": {"username": "alexeybe1kin"}})
         check(response.status_code == 200 and isinstance(response.json()["result"]["result"], int), "public HTTPS executor failed")
-        response = execute("POST", f"/v2/tools/{AI_TOOL_ID}/invoke", json={"args": {"prompt": "say ToolGate is ready"}})
+        response = execute("POST", f"/v2/tools/{AI_TOOL_ID}/invoke", json={"action_id": run_id + "-ollama", "args": {"prompt": "say ToolGate is ready"}})
         check(response.status_code == 200 and response.json()["result"]["result"].strip(), "isolated Ollama executor failed")
 
         run_args = {"base": 3, "items": ["a", "b"], "mode": "fast"}
-        response = execute("POST", f"/v2/automations/{AUTOMATION_ID}/run", json={"args": run_args})
+        response = execute("POST", f"/v2/automations/{AUTOMATION_ID}/run", json={"action_id": run_id + "-workflow", "args": run_args})
         check(response.status_code == 200, f"automation failed: {response.text}")
         check(response.json()["result"]["result"] == {"total": 5, "large": True, "last": "b", "speed": 2},
               "automation returned an unexpected result")
