@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Bind automation approval to child definitions and execute the checked snapshot, preventing an owner edit from widening an existing approval.
+
 - Persist stable tool/workflow dispatch identities before execution; atomically consume approval and reserve paid cost. Replays return recorded status; ambiguous interruptions hold without redispatch.
 - Add owner-only cumulative/per-job microUSD caps and immutable job/reservation accounting. Bound Gemini 2.5 Flash-Lite requests and reconcile known usage; disable unaccounted paid routes.
 - Add action/job fields to HTTP, CLI and MCP and agent-specific status lookup. See `docs/DURABLE_EXECUTION_AND_SPENDING.md` for required caller changes and unsupported routes.

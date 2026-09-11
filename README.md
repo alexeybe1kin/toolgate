@@ -317,3 +317,5 @@ toolgate/tests/            Deterministic security, workflow, research, and MCP t
 ```
 
 ToolGate v2 deliberately starts from a clean control-plane model. Deprecated legacy registries, unrestricted scripts, and old execution paths are not migrated.
+
+Automation confirmations bind every referenced child definition and version, including nested branches. Changes before dispatch require fresh approval; accepted runs use the checked snapshot. Legacy automation approvals without child bindings are rejected.

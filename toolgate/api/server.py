@@ -1203,7 +1203,8 @@ def _run_workflow_steps(steps: list, state: dict, actor: str, approval_granted: 
         kind = step["type"]
         result = None
         if kind == "tool_call":
-            tool = control_plane.get("tool", step["tool_id"])
+            tool = (state["tool_snapshot"].get(step["tool_id"]) if "tool_snapshot" in state
+                    else control_plane.get("tool", step["tool_id"]))
             if not tool or tool.get("status") != "active":
                 deny("TOOL_UNAVAILABLE", f"Workflow references unavailable tool '{step['tool_id']}'")
             if tool.get("authorization") != "auto" and not approval_granted:
@@ -1655,6 +1656,7 @@ def run_automation(automation_id: str, payload: V2Invoke, agent: dict = Depends(
         control_plane.event("execution_blocked", "warning", "automation", automation_id, agent["name"], {"code": "POLICY_DENIED"})
         deny("POLICY_DENIED", "This automation is permanently blocked by its owner policy")
     approval_granted = False
+    tool_snapshot = {}
     if authorization != "auto":
         if not payload.approval_request_id:
             expiry = int(control_plane.settings().get("default_confirmation_expiry_seconds", 60))
@@ -1669,7 +1671,8 @@ def run_automation(automation_id: str, payload: V2Invoke, agent: dict = Depends(
     enforce_usage_limits("automation", automation, "automation_executed")
     limits = automation.get("policy", {}).get("usage_limits", {})
     def authorize(conn):
-        nonlocal approval_granted
+        nonlocal approval_granted, tool_snapshot
+        tool_snapshot = control_plane.automation_tool_snapshot(conn, automation_id, automation.get("version"))
         if authorization != "auto":
             approval_granted, reason = control_plane.consume_verification_in_transaction(
                 conn, payload.approval_request_id, "automation", automation_id, payload.args,
@@ -1684,7 +1687,7 @@ def run_automation(automation_id: str, payload: V2Invoke, agent: dict = Depends(
         deny("ACTION_CONFLICT", str(exc), 409)
     if not dispatch:
         return journal.response(record)
-    state = {"automation_id": automation_id, "action_id": payload.action_id,
+    state = {"automation_id": automation_id, "tool_snapshot": tool_snapshot, "action_id": payload.action_id,
              "job_id": payload.job_id, "actor_id": agent["id"], "args": payload.args, "vars": {}, "last": None,
              "results": [], "count": 0, "max_steps": int(limits.get("max_steps", 100)),
              "started_at": time.monotonic(),

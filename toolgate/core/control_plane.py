@@ -562,6 +562,44 @@ def action_digest(subject_type: str, subject_id: str, args: dict, version: int |
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def automation_tool_snapshot(conn, automation_id: str, version: int | None) -> dict:
+    row = conn.execute("SELECT * FROM v2_objects WHERE kind='automation' AND id=?", (automation_id,)).fetchone()
+    if not row or _row(row).get("version") != version:
+        raise ValueError("Automation changed; request fresh confirmation")
+    tools = {}
+
+    def visit(steps):
+        for step in steps:
+            kind = step.get("type")
+            if kind == "tool_call":
+                tool_id = step["tool_id"]
+                child = conn.execute("SELECT * FROM v2_objects WHERE kind='tool' AND id=?", (tool_id,)).fetchone()
+                if not child or _row(child).get("status") != "active":
+                    raise ValueError(f"Child tool {tool_id} is unavailable; review the automation")
+                tools[tool_id] = _row(child)
+            elif kind == "condition":
+                visit(step.get("then", []))
+                visit(step.get("else", []))
+            elif kind == "switch":
+                for branch in step.get("cases", {}).values():
+                    visit(branch)
+                visit(step.get("default", []))
+            elif kind == "loop":
+                visit(step.get("steps", []))
+            elif kind == "retry":
+                visit([step["step"]])
+
+    visit(_row(row).get("workflow", []))
+    return tools
+
+
+def child_bindings(tools: dict) -> dict:
+    # Bind definitions as well as versions: delete/recreate must not reuse an approval.
+    return {key: {"version": tool.get("version"), "digest": hashlib.sha256(
+        json.dumps(tool, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+        for key, tool in tools.items()}
+
+
 def create_verification_request(title: str, details: str, actor: str, subject_type: str,
                                 subject_id: str, args: dict, version: int | None,
                                 expiry_seconds: int = 60, actor_id: str | None = None) -> dict:
@@ -577,6 +615,8 @@ def create_verification_request(title: str, details: str, actor: str, subject_ty
     }
     with _conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        if subject_type == "automation":
+            binding["child_tools"] = child_bindings(automation_tool_snapshot(conn, subject_id, version))
         record = _insert_request(conn, {
             "kind": "verification", "title": title, "details": details, "actor": actor,
             "payload": {"subject_type": subject_type, "subject_id": subject_id,
@@ -627,6 +667,13 @@ def consume_verification_in_transaction(conn, request_id: str, subject_type: str
     expected = action_digest(subject_type, subject_id, args, version)
     if not secrets.compare_digest(str(binding.get("args_digest", "")), expected):
         return False, "Approval does not match this exact action"
+    if subject_type == "automation":
+        try:
+            current = child_bindings(automation_tool_snapshot(conn, subject_id, version))
+        except ValueError as exc:
+            return False, str(exc)
+        if binding.get("child_tools") != current:
+            return False, "Automation child definitions changed; request fresh confirmation"
     binding["consumed_at"] = now.isoformat()
     binding["consumed_by"] = actor
     record["payload"]["binding"] = binding

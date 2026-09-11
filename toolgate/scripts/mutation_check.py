@@ -260,6 +260,16 @@ MUTANTS.extend([('dispatch without a committed record',
   'toolgate/tests/test_spending.py::test_price_change_before_reservation_cannot_use_old_rates')])
 
 
+MUTANTS.extend([
+    ("automation child binding omitted", "toolgate/core/control_plane.py",
+     'if binding.get("child_tools") != current:', 'if False:',
+     "toolgate/tests/test_automation_approval.py::test_changed_child_invalidates_approval_without_consumption"),
+    ("automation child snapshot discarded", "toolgate/api/server.py",
+     '"tool_snapshot": tool_snapshot,', '',
+     "toolgate/tests/test_automation_approval.py::test_edit_after_consumption_cannot_replace_pinned_child"),
+])
+
+
 def run_tests(root: Path, tests: list[str], name: str) -> subprocess.CompletedProcess:
     env = {**os.environ, "PYTHONPATH": str(root), "PYTHONDONTWRITEBYTECODE": "1"}
     return subprocess.run(
