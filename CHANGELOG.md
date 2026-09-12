@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+## 0.3.0
+
+ToolGate becomes only an execution boundary, and the money and approval paths
+are made durable.
+
+- **The AI layer is gone.** Sessions, planner, research-as-reasoning and the
+  proposals engine are removed; Pi is the only thing that thinks. Search and
+  fetch remain as executors. A mutation drill fails if the AI routes return.
+- **Scoped identity over the MCP bridge** — the unscoped console that listed and
+  ran every tool, and reached MemoryGate credentials, is replaced by an
+  authenticated bridge on the same scoped path.
+- **Durable execution.** A stable action id and dispatch record are created
+  before dispatch; the same id and arguments returns the existing status,
+  different arguments fail, and an ambiguous interruption holds as
+  outcome-unknown rather than being guessed.
+- **Spend caps.** Paid routes stay disabled until per-job and cumulative
+  ceilings exist; a conservative upper bound is reserved before each request,
+  spanning a workflow and its children; unknown or expired pricing blocks; an
+  owner can release a verified-unused hold.
+- **Approval integrity hardened.** Verification requests can be created only by
+  the invoke path, decisions serialize with consumption, a stale write cannot
+  revive a consumed approval, bootstrap never resurrects a revoked or narrowed
+  key, and an approved automation is bound to the exact child-tool versions it
+  was granted against.
+- **Public-HTTPS egress enforced at the socket** — private, loopback,
+  link-local, carrier-grade-NAT (Tailscale) and metadata addresses are rejected
+  after DNS resolution and every redirect, with the socket pinned to the
+  validated address.
+- Every registered tool gets finite rate ceilings by default.
+
+
 - F10: Add owner-attested, audited local hold releases while preserving unknown action identity; contradictory late replies freeze paid dispatch.
 
 - Bind automation approval to child definitions and execute the checked snapshot, preventing an owner edit from widening an existing approval.

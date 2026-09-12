@@ -21,7 +21,7 @@ from toolgate.core import control_plane, execution_journal as journal, legacy_ar
 from toolgate.core.public_https import DestinationDenied, public_client, public_url, resolve_public
 from toolgate.executors import research
 
-SERVICE_VERSION = "0.2.2"
+SERVICE_VERSION = "0.3.0"
 
 app = FastAPI(title="ToolGate", version=SERVICE_VERSION)
 app.add_middleware(
